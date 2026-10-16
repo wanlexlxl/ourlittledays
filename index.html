@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="dark" />
+<title>两人小日子 · 我们的生活手账</title>
+<meta name="description" content="把平凡的小日子，过成我们喜欢的样子。" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='25' font-size='24'%3E%F0%9F%8D%80%3C/text%3E%3C/svg%3E" />
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<a class="skip-link" href="#view">跳到主要内容</a>
+
+<div id="auth-root"></div>
+
+<div class="app" id="app">
+  <aside class="sidebar" id="sidebar" aria-label="我们的空间导航"></aside>
+  <div class="main">
+    <header class="topbar" id="topbar"></header>
+    <main class="content" id="view" tabindex="-1"></main>
+  </div>
+</div>
+
+<div class="scrim" id="scrim" data-action="close-drawer" hidden></div>
+<div class="toast-wrap" id="toast" aria-live="polite" aria-atomic="true"></div>
+<div id="modal-root"></div>
+
+<script src="app.js" defer></script>
+</body>
+</html>
