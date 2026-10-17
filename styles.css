@@ -1037,7 +1037,19 @@ pre.sql {
 .inline-form { flex-wrap: wrap; }
 .inline-form .input { min-width: 0; }
 .select-input { flex: 0 0 84px; }
+.select-wide { flex: 1 1 140px; min-width: 0; max-width: 220px; }
 .num-input { flex: 0 0 104px; }
+
+/* 存钱页里的心愿进度行 */
+.wish-row {
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 14px 0;
+  border-top: 1px solid var(--border-soft);
+}
+.wish-row:first-child { border-top: 0; }
+.wish-row .todo-main { flex: 1; min-width: 0; }
+.wish-row .btn { flex: none; }
+.wish-row .todo-when { overflow-wrap: anywhere; }
 
 /* 每行的删除按钮 */
 .row-x {

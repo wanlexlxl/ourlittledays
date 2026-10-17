@@ -1614,6 +1614,12 @@
                 '<div class="wish-meta"><span>目标 ¥' + num(state.saving.goal, 0) + '</span>' +
                   '<button class="auth-link" data-action="goal">改目标</button></div>' +
                 '<div class="inline-form" style="margin-top:18px">' +
+                  '<select class="input select-wide" id="saving-wish" aria-label="存进哪个目标">' +
+                    '<option value="">共同小目标</option>' +
+                    alive(state.wishes).map(function (w) {
+                      return '<option value="' + w.id + '">' + esc(w.title) + '</option>';
+                    }).join('') +
+                  '</select>' +
                   '<input class="input num-input" id="new-saving" data-enter="add-saving" type="number" min="0" step="1" placeholder="金额" aria-label="存入金额" />' +
                   '<button class="btn btn-primary" data-action="add-saving">' + icon('plus', 16) + '存进去</button>' +
                   '<button class="btn btn-ghost" data-action="save-money" data-amount="100">+100</button>' +
@@ -1624,12 +1630,21 @@
             '</div>' +
           '</section>' +
           '<section class="card panel reveal" style="--d:120ms">' +
+            '<div class="card-head"><div><h3 class="card-title">心愿进度</h3>' +
+              '<p class="card-sub">存进心愿的钱同时算进上面的总目标</p></div></div>' +
+            (alive(state.wishes).length
+              ? '<ul>' + alive(state.wishes).map(wishProgressRow).join('') + '</ul>'
+              : '<p class="empty">还没有心愿，去「心愿清单」加一个。</p>') +
+          '</section>' +
+          '<section class="card panel reveal" style="--d:160ms">' +
             '<div class="card-head"><div><h3 class="card-title">存入记录</h3>' +
               '<p class="card-sub">每一次存下，都是朝着同一个方向</p></div></div>' +
             (logs.length ? '<ul>' + logs.map(function (l) {
+              var w = l.wishId ? findRecord('wishes', l.wishId) : null;
               return '<li class="ledger-row">' +
-                '<span class="cat">🪙</span>' +
-                '<div class="todo-main"><p class="todo-text">' + esc(l.who) + ' 存了一笔</p>' +
+                '<span class="cat">' + (w ? w.emoji : '🪙') + '</span>' +
+                '<div class="todo-main"><p class="todo-text">' + esc(l.who) + ' 存了一笔' +
+                  (w ? ' · ' + esc(w.title) : '') + '</p>' +
                 '<p class="todo-when">' + dayLabel(l.day) + '</p></div>' +
                 '<span class="amount in">+' + num(l.amount, 0) + '</span>' +
                 delButton('savingsLog', l.id, l.who + ' 存入 ' + l.amount) +
@@ -2225,6 +2240,14 @@
     if (!rec) return;
     var label = rec.text || rec.title || rec.note || rec.who || '这条记录';
     if (!window.confirm('删除「' + label + '」？\n两台设备都会一起删掉。')) return;
+    // 删掉一条存进心愿的记录，要把心愿的已存金额退回去
+    if (kind === 'savingsLog' && rec.wishId) {
+      var w = findRecord('wishes', rec.wishId);
+      if (w) {
+        w.saved = Math.max(0, (w.saved || 0) - (rec.amount || 0));
+        w.updatedAt = Date.now();
+      }
+    }
     if (!killRecord(kind, id)) return;
     saveState();
     render();
@@ -2252,7 +2275,7 @@
     var el = document.getElementById('new-saving');
     var amount = Math.abs(parseFloat(el && el.value ? el.value : '') || 0);
     if (!amount) { toast('想存多少？填个数字。'); return; }
-    saveMoney(amount);
+    saveMoney(amount, selectedWishId());
   }
 
   function addPostFromForm() {
@@ -2508,15 +2531,48 @@
     toast(person(who).name + ' 今天的心情是 ' + mood);
   }
 
-  function saveMoney(amount) {
+  function saveMoney(amount, wishId) {
     var now = new Date();
     var time = pad2(now.getHours()) + ':' + pad2(now.getMinutes());
-    state.saving.saved += amount;
     state.savingsLog.push({
-      id: uid('s'), who: currentName(), amount: amount, day: 0, time: time, updatedAt: Date.now()
+      id: uid('s'), who: currentName(), amount: amount, day: 0, time: time,
+      wishId: wishId || '', updatedAt: Date.now()
     });
+    var wish = wishId ? findRecord('wishes', wishId) : null;
+    if (wish) {
+      wish.saved = (wish.saved || 0) + amount;
+      wish.updatedAt = Date.now();
+    }
+    state.saving.saved = savedTotal();
     saveState(); render();
-    toast('存下 ¥' + num(amount, 0) + '，离目标更近了一点。');
+    toast(wish
+      ? '存下 ¥' + num(amount, 0) + '，记在「' + wish.title + '」上了。'
+      : '存下 ¥' + num(amount, 0) + '，离目标更近了一点。');
+  }
+
+  function selectedWishId() {
+    var sel = document.getElementById('saving-wish');
+    return sel ? sel.value : '';
+  }
+
+  function pickWishToSave(id) {
+    var sel = document.getElementById('saving-wish');
+    if (sel) sel.value = id;
+    var amt = document.getElementById('new-saving');
+    if (amt) { amt.focus(); if (amt.select) amt.select(); }
+  }
+
+  function wishProgressRow(w) {
+    var pct = w.target ? Math.min(100, Math.round((w.saved / w.target) * 100)) : 0;
+    return '<li class="wish-row">' +
+      '<span class="cat">' + w.emoji + '</span>' +
+      '<div class="todo-main">' +
+        '<p class="todo-text">' + esc(w.title) + '</p>' +
+        '<div class="bar" style="margin:7px 0 6px"><i class="bar-fill" style="width:' + pct + '%"></i></div>' +
+        '<p class="todo-when">已存 ¥' + num(w.saved, 0) + ' / 目标 ¥' + num(w.target, 0) + ' · ' + pct + '%</p>' +
+      '</div>' +
+      '<button class="btn btn-ghost btn-sm" data-action="pick-wish" data-wish="' + w.id + '">存一点</button>' +
+      '</li>';
   }
 
   function exportData() {
@@ -2614,7 +2670,10 @@
         setMood(el.dataset.who, el.dataset.mood);
         break;
       case 'save-money':
-        saveMoney(Number(el.dataset.amount) || 0);
+        saveMoney(Number(el.dataset.amount) || 0, selectedWishId());
+        break;
+      case 'pick-wish':
+        pickWishToSave(el.dataset.wish);
         break;
       case 'add-todo':
         addTodoFromForm();
@@ -2767,6 +2826,16 @@
     syncInit();
     render();
     if (!location.hash) setHash(state.view);
+    registerSW();
+  }
+
+  // 装成 App 用：注册 Service Worker（file:// 下浏览器不允许，跳过即可）
+  function registerSW() {
+    if (!('serviceWorker' in navigator)) return;
+    if (location.protocol !== 'http:' && location.protocol !== 'https:') return;
+    try {
+      navigator.serviceWorker.register('sw.js').catch(function () { /* 失败不影响使用 */ });
+    } catch (err) { /* 忽略 */ }
   }
 
   document.addEventListener('focusout', function () {
