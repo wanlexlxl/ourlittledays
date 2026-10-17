@@ -38,6 +38,9 @@
     arrowRight: '<path d="M4 12h15"/><path d="m13 6 6 6-6 6"/>',
     download: '<path d="M20.5 15.5v3a2.5 2.5 0 0 1-2.5 2.5H6a2.5 2.5 0 0 1-2.5-2.5v-3"/><path d="m7.5 10.5 4.5 4.5 4.5-4.5"/><path d="M12 15V3.5"/>',
     upload: '<path d="M20.5 15.5v3a2.5 2.5 0 0 1-2.5 2.5H6a2.5 2.5 0 0 1-2.5-2.5v-3"/><path d="m7.5 8 4.5-4.5L16.5 8"/><path d="M12 3.5V15"/>',
+    trash: '<path d="M3.5 6.5h17"/><path d="M8.5 6.5V4.8A1.8 1.8 0 0 1 10.3 3h3.4a1.8 1.8 0 0 1 1.8 1.8v1.7"/><path d="M18.5 6.5v12.7a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2V6.5"/><path d="M10 11v6"/><path d="M14 11v6"/>',
+    message: '<path d="M21 11.6a8.6 8.6 0 0 1-9.2 8.6 9 9 0 0 1-3.9-.9L3 21l1.6-4.6A8.5 8.5 0 0 1 3.5 11 8.6 8.6 0 0 1 12 2.5h.4A8.6 8.6 0 0 1 21 11.1z"/>',
+    send: '<path d="M21 3 10.5 13.5"/><path d="M21 3l-6.5 18-4-8.5L2 8.5 21 3z"/>',
     sliders: '<path d="M4 6h9"/><path d="M17 6h3"/><path d="M4 12h3"/><path d="M11 12h9"/><path d="M4 18h7"/><path d="M15 18h5"/><circle cx="15" cy="6" r="2.2"/><circle cx="9" cy="12" r="2.2"/><circle cx="13" cy="18" r="2.2"/>',
     calendar: '<path d="M8 3v3.5"/><path d="M16 3v3.5"/><rect x="3.5" y="5" width="17" height="16" rx="2.5"/><path d="M3.5 10h17"/>',
     receipt: '<path d="M5 3.5 7 5l2-1.5L11 5l2-1.5L15 5l2-1.5 2 1.5v17l-2-1.4L15 22l-2-1.4L11 22l-2-1.4L7 22l-2-1.4z"/><path d="M8.5 9h7"/><path d="M8.5 13h7"/><path d="M8.5 16.5h4"/>',
@@ -203,6 +206,14 @@
         { id: 'm4', day: ago(2), who: 'b', mood: '😴', note: '加班到很晚，先睡啦。', time: '23:40' },
         { id: 'm5', day: ago(3), who: 'a', mood: '🙂', note: '阴天，适合窝在沙发上看剧。', time: '20:15' },
         { id: 'm6', day: ago(5), who: 'b', mood: '😤', note: '为一颗葱吵了两句，五分钟就和好了。', time: '19:30' }
+      ],
+      posts: [
+        { id: 'p1', who: 'a', text: '今天顺手买了一束花，放在餐桌上了。', day: 0, time: '20:10' },
+        { id: 'p2', who: 'b', text: '下班路上看到晚霞，拍下来给你看（虽然拍得很糊）。', day: -1, time: '18:42' }
+      ],
+      comments: [
+        { id: 'c1', postId: 'p1', who: 'b', text: '好看！明天换我买。', day: 0, time: '20:15' },
+        { id: 'c2', postId: 'p2', who: 'a', text: '糊也好看，因为是你拍的。', day: -1, time: '19:00' }
       ]
     };
   }
@@ -236,6 +247,7 @@
   }
 
   function saveState() {
+    state.saving.saved = savedTotal();
     try {
       localStorage.setItem(CONFIG.storageKey, JSON.stringify(state));
     } catch (err) {
@@ -484,6 +496,8 @@
       saving: state.saving,
       savingsLog: state.savingsLog,
       moods: state.moods,
+      posts: state.posts,
+      comments: state.comments,
       auth: { accounts: accounts() }
     };
   }
@@ -510,6 +524,7 @@
   function mergeStates(local, remote) {
     if (!remote) return local;
     var logs = mergeList(local.savingsLog, remote.savingsLog);
+    var liveLogs = logs.filter(function (l) { return !l.deleted; });
     var localAuth = local.auth || {};
     var remoteAuth = remote.auth || {};
     var out = {
@@ -523,9 +538,11 @@
       wishes: mergeList(local.wishes, remote.wishes),
       savingsLog: logs,
       moods: mergeList(local.moods, remote.moods),
+      posts: mergeList(local.posts, remote.posts),
+      comments: mergeList(local.comments, remote.comments),
       saving: {
         goal: (remote.saving && remote.saving.goal) || (local.saving && local.saving.goal) || 20000,
-        saved: logs.reduce(function (s, l) { return s + (l.amount || 0); }, 0)
+        saved: liveLogs.reduce(function (s, l) { return s + (l.amount || 0); }, 0)
       }
     };
     return out;
@@ -1066,8 +1083,26 @@
 
   /* ---------------------------------------------------------- 派生数据 */
 
+  // 删掉的记录留一个「墓碑」（deleted:true + 新的 updatedAt），
+  // 否则另一台设备按 id 求并集时会把它复活。
+  function alive(list) {
+    return (list || []).filter(function (r) { return !r.deleted; });
+  }
+
+  function killRecord(kind, id) {
+    var rec = (state[kind] || []).filter(function (r) { return r.id === id; })[0];
+    if (!rec) return false;
+    rec.deleted = true;
+    rec.updatedAt = Date.now();
+    return true;
+  }
+
+  function findRecord(kind, id) {
+    return (state[kind] || []).filter(function (r) { return r.id === id; })[0];
+  }
+
   function expenses(filterFn) {
-    return state.ledger.filter(function (e) { return e.amount < 0; }).filter(filterFn);
+    return alive(state.ledger).filter(function (e) { return e.amount < 0; }).filter(filterFn);
   }
 
   function sum(list) {
@@ -1088,7 +1123,7 @@
 
   function monthIncome() {
     var t = today();
-    return sum(state.ledger.filter(function (e) {
+    return sum(alive(state.ledger).filter(function (e) {
       if (e.amount <= 0) return false;
       var d = entryDate(e);
       return d.getMonth() === t.getMonth() && d.getFullYear() === t.getFullYear();
@@ -1096,20 +1131,28 @@
   }
 
   function openWishCount() {
-    return state.wishes.filter(function (w) { return w.status !== '已完成'; }).length;
+    return alive(state.wishes).filter(function (w) { return w.status !== '已完成'; }).length;
   }
 
   function pendingWishCount() {
-    return state.wishes.filter(function (w) { return w.status === '等你一起商量'; }).length;
+    return alive(state.wishes).filter(function (w) { return w.status === '等你一起商量'; }).length;
   }
 
   function savingPct() {
-    return Math.min(100, Math.round((state.saving.saved / state.saving.goal) * 100));
+    return Math.min(100, Math.round((savedTotal() / state.saving.goal) * 100));
+  }
+
+  function savedTotal() {
+    return alive(state.savingsLog).reduce(function (s, l) { return s + (l.amount || 0); }, 0);
   }
 
   function moodOf(who, day) {
-    var list = state.moods.filter(function (m) { return m.who === who && m.day === day; });
+    var list = alive(state.moods).filter(function (m) { return m.who === who && m.day === day; });
     return list.length ? list[list.length - 1] : null;
+  }
+
+  function postComments(postId) {
+    return alive(state.comments).filter(function (c) { return c.postId === postId; });
   }
 
   function person(who) {
@@ -1158,6 +1201,7 @@
     var items = [
       { view: 'overview', label: '今日总览', ic: 'grid' },
       { view: 'todos', label: '每日待办', ic: 'listChecks' },
+      { view: 'posts', label: '我们的说说', ic: 'message' },
       { view: 'ledger', label: '双人账本', ic: 'wallet' },
       { view: 'wishes', label: '心愿清单', ic: 'gift', badge: pendingWishCount() },
       { view: 'savings', label: '一起存钱', ic: 'piggy' },
@@ -1316,7 +1360,7 @@
       },
       {
         title: '我们一起存下', ic: 'sprout',
-        value: '<span class="cur">¥</span>' + num(state.saving.saved, 0),
+        value: '<span class="cur">¥</span>' + num(savedTotal(), 0),
         note: '共同存的小目标已到 ' + savingPct() + '%'
       }
     ];
@@ -1333,6 +1377,12 @@
     }).join('') + '</section>';
   }
 
+  function delButton(kind, id, label) {
+    return '<button class="row-x" data-action="del" data-kind="' + kind + '" data-id="' + id + '"' +
+      ' aria-label="删除' + (label ? '：' + esc(label) : '') + '" title="删除">' +
+      icon('trash', 14) + '</button>';
+  }
+
   function todoRow(t) {
     return '<li class="todo-row' + (t.done ? ' done' : '') + '">' +
       '<button class="check' + (t.done ? ' on' : '') + '" data-action="toggle-todo" data-id="' + t.id + '"' +
@@ -1343,6 +1393,7 @@
         '<p class="todo-when">' + esc(t.when) + '</p>' +
       '</div>' +
       '<span class="tag">' + esc(t.tag) + '</span>' +
+      delButton('todos', t.id, t.text) +
       '</li>';
   }
 
@@ -1361,7 +1412,7 @@
   }
 
   function todoPanel() {
-    var list = state.todos.slice(0, 3);
+    var list = alive(state.todos).slice(0, 3);
     return '<section class="card panel reveal" style="--d:340ms">' +
       '<div class="card-head">' +
         '<div><h3 class="card-title">今天的小事</h3>' +
@@ -1411,14 +1462,15 @@
       lede: '不着急，我们有的是时间。',
       render: function () {
         var groups = ['今天', '明天', '本周'];
-        var done = state.todos.filter(function (t) { return t.done; }).length;
-        var pct = state.todos.length ? Math.round((done / state.todos.length) * 100) : 0;
+        var all = alive(state.todos);
+        var done = all.filter(function (t) { return t.done; }).length;
+        var pct = all.length ? Math.round((done / all.length) * 100) : 0;
 
         return pageHead(VIEWS.todos) +
           '<section class="card panel reveal" style="--d:40ms">' +
             '<div class="card-head">' +
               '<div><h3 class="card-title">今天的进度</h3>' +
-              '<p class="card-sub">' + done + ' / ' + state.todos.length + ' 件小事已经打勾</p></div>' +
+              '<p class="card-sub">' + done + ' / ' + all.length + ' 件小事已经打勾</p></div>' +
               '<span class="tag">' + pct + '%</span>' +
             '</div>' +
             '<div class="bar"><i class="bar-fill" style="width:' + pct + '%"></i></div>' +
@@ -1428,14 +1480,14 @@
             '</div>' +
           '</section>' +
           groups.map(function (g, i) {
-            var rows = state.todos.filter(function (t) { return t.when === g; });
+            var rows = all.filter(function (t) { return t.when === g; });
             if (!rows.length) return '';
             return '<section class="card panel reveal" style="--d:' + (80 + i * 40) + 'ms">' +
               '<div class="card-head"><div><h3 class="card-title">' + g + '</h3>' +
               '<p class="card-sub">' + rows.filter(function (t) { return t.done; }).length + ' / ' + rows.length + ' 已完成</p></div></div>' +
               '<ul>' + rows.map(todoRow).join('') + '</ul></section>';
           }).join('') +
-          (state.todos.length ? '' : '<p class="empty">还没有待办，写一件试试。</p>');
+          (all.length ? '' : '<p class="empty">还没有待办，写一件试试。</p>');
       }
     },
 
@@ -1448,7 +1500,8 @@
       render: function () {
         var expense = monthSpend();
         var income = monthIncome();
-        var rows = state.ledger.slice().sort(function (a, b) { return b.day - a.day; });
+        var live = alive(state.ledger);
+        var rows = live.slice().sort(function (a, b) { return b.day - a.day; });
         var cards = [
           { t: '本月支出', v: '<span class="cur">¥</span>' + num(expense), ic: 'receipt' },
           { t: '本月收入', v: '<span class="cur">¥</span>' + num(income), ic: 'sprout' },
@@ -1461,11 +1514,24 @@
               '<span class="stat-icon">' + icon(c.ic, 16) + '</span></div>' +
               '<p class="stat-value">' + c.v + '</p></article>';
           }).join('') + '</section>' +
+          '<section class="card panel reveal" style="--d:120ms">' +
+            '<div class="card-head"><div><h3 class="card-title">记一笔</h3>' +
+              '<p class="card-sub">金额填正数就行，收入还是支出靠左边选</p></div></div>' +
+            '<div class="inline-form">' +
+              '<select class="input select-input" id="new-ledger-kind" aria-label="收入还是支出">' +
+                '<option value="out">支出</option><option value="in">收入</option>' +
+              '</select>' +
+              '<input class="input" id="new-ledger" data-enter="add-ledger" placeholder="这笔钱花在哪了？" aria-label="账目名称" />' +
+              '<input class="input num-input" id="new-ledger-amount" data-enter="add-ledger" type="number" min="0" step="0.01" placeholder="金额" aria-label="金额" />' +
+              '<button class="btn btn-primary" data-action="add-ledger">' + icon('plus', 16) + '记一笔</button>' +
+            '</div>' +
+          '</section>' +
           '<section class="card panel reveal" style="--d:160ms">' +
             '<div class="card-head"><div><h3 class="card-title">最近的记录</h3>' +
-              '<p class="card-sub">一共 ' + state.ledger.length + ' 笔，都是我们一起过的日子</p></div>' +
+              '<p class="card-sub">一共 ' + live.length + ' 笔，都是我们一起过的日子</p></div>' +
               '<span class="tag warm">今天 ¥' + num(todaySpend()) + '</span></div>' +
-            '<ul>' + rows.map(ledgerRow).join('') + '</ul>' +
+            (rows.length ? '<ul>' + rows.map(ledgerRow).join('') + '</ul>'
+              : '<p class="empty">还没有记录，记第一笔试试。</p>') +
           '</section>';
       }
     },
@@ -1486,7 +1552,7 @@
               '<button class="btn btn-primary" data-action="add-wish">' + icon('plus', 16) + '记下心愿</button>' +
             '</div>' +
           '</section>' +
-          '<section class="wish-grid">' + state.wishes.map(function (w, i) {
+          '<section class="wish-grid">' + alive(state.wishes).map(function (w, i) {
             return wishCard(w, 80 + i * 40);
           }).join('') + '</section>';
       }
@@ -1500,21 +1566,24 @@
       lede: '共同存的小目标，已经开始了。',
       render: function () {
         var pct = savingPct();
-        var logs = state.savingsLog.slice().sort(function (a, b) { return b.day - a.day; });
+        var logs = alive(state.savingsLog).slice().sort(function (a, b) { return b.day - a.day; });
+        var saved = savedTotal();
         return pageHead(VIEWS.savings) +
           '<section class="card panel reveal" style="--d:40ms">' +
             '<div class="goal-wrap">' +
               ring(pct) +
               '<div>' +
                 '<h3 class="card-title">我们的小目标</h3>' +
-                '<p class="card-sub">已经存下 ¥' + num(state.saving.saved, 0) + '，离目标还有 ¥' +
-                  num(Math.max(0, state.saving.goal - state.saving.saved), 0) + '</p>' +
+                '<p class="card-sub">已经存下 ¥' + num(saved, 0) + '，离目标还有 ¥' +
+                  num(Math.max(0, state.saving.goal - saved), 0) + '</p>' +
                 '<div class="bar" style="margin:18px 0 14px"><i class="bar-fill" style="width:' + pct + '%"></i></div>' +
                 '<div class="wish-meta"><span>目标 ¥' + num(state.saving.goal, 0) + '</span><span>' + pct + '%</span></div>' +
                 '<div class="inline-form" style="margin-top:18px">' +
-                  '<button class="btn btn-ghost" data-action="save-money" data-amount="100">存 ¥100</button>' +
-                  '<button class="btn btn-ghost" data-action="save-money" data-amount="500">存 ¥500</button>' +
-                  '<button class="btn btn-primary" data-action="save-money" data-amount="1000">存 ¥1000</button>' +
+                  '<input class="input num-input" id="new-saving" data-enter="add-saving" type="number" min="0" step="1" placeholder="金额" aria-label="存入金额" />' +
+                  '<button class="btn btn-primary" data-action="add-saving">' + icon('plus', 16) + '存进去</button>' +
+                  '<button class="btn btn-ghost" data-action="save-money" data-amount="100">+100</button>' +
+                  '<button class="btn btn-ghost" data-action="save-money" data-amount="500">+500</button>' +
+                  '<button class="btn btn-ghost" data-action="save-money" data-amount="1000">+1000</button>' +
                 '</div>' +
               '</div>' +
             '</div>' +
@@ -1527,7 +1596,9 @@
                 '<span class="cat">🪙</span>' +
                 '<div class="todo-main"><p class="todo-text">' + esc(l.who) + ' 存了一笔</p>' +
                 '<p class="todo-when">' + dayLabel(l.day) + '</p></div>' +
-                '<span class="amount in">+' + num(l.amount, 0) + '</span></li>';
+                '<span class="amount in">+' + num(l.amount, 0) + '</span>' +
+                delButton('savingsLog', l.id, l.who + ' 存入 ' + l.amount) +
+                '</li>';
             }).join('') + '</ul>' : '<p class="empty">还没有存入记录。</p>') +
           '</section>';
       }
@@ -1554,7 +1625,7 @@
             }).join('') + '</div></section>';
         }).join('');
 
-        var history = state.moods.slice().sort(function (a, b) { return b.day - a.day; });
+        var history = alive(state.moods).slice().sort(function (a, b) { return b.day - a.day; });
 
         return pageHead(VIEWS.moods) + picker +
           '<section class="card panel reveal" style="--d:120ms">' +
@@ -1565,12 +1636,71 @@
                 '<span class="history-emoji">' + m.mood + '</span>' +
                 '<div class="todo-main"><p class="history-note">' + esc(m.note) + '</p>' +
                 '<p class="history-time">' + person(m.who).name + ' · ' + dayLabel(m.day) + ' ' + m.time + '</p></div>' +
+                delButton('moods', m.id, m.note) +
                 '</li>';
             }).join('') + '</ul>' : '<p class="empty">还没有心情记录。</p>') +
           '</section>';
       }
+    },
+
+    posts: {
+      title: '我们的说说',
+      eyebrow: 'WORDS BETWEEN US',
+      h1: '想说什么，就写下来',
+      emoji: '💬',
+      lede: '一句废话、一件小事、一个忽然冒出来的想法。',
+      render: function () {
+        var me = currentUser() || { emoji: '🍀' };
+        var list = alive(state.posts).slice().sort(function (a, b) {
+          if (a.day !== b.day) return b.day - a.day;
+          return String(b.time || '').localeCompare(String(a.time || ''));
+        });
+
+        return pageHead(VIEWS.posts) +
+          '<section class="card panel reveal" style="--d:40ms">' +
+            '<div class="composer">' +
+              '<span class="avatar">' + me.emoji + '</span>' +
+              '<input class="input" id="new-post" data-enter="add-post" maxlength="300"' +
+                ' placeholder="此刻想和你说点什么？" aria-label="新的说说" />' +
+              '<button class="btn btn-primary" data-action="add-post">' + icon('send', 15) + '发布</button>' +
+            '</div>' +
+          '</section>' +
+          (list.length
+            ? '<section class="feed">' + list.map(postCard).join('') + '</section>'
+            : '<p class="empty">还没有说说，写第一条吧。</p>');
+      }
     }
   };
+
+  function postCard(p) {
+    var who = person(p.who);
+    var comments = postComments(p.id);
+    return '<article class="card post reveal">' +
+      '<div class="post-head">' +
+        '<span class="post-ava">' + who.emoji + '</span>' +
+        '<div class="post-meta">' +
+          '<p class="post-name">' + esc(who.name) + '</p>' +
+          '<p class="post-time">' + dayLabel(p.day) + ' ' + esc(p.time || '') + '</p>' +
+        '</div>' +
+        delButton('posts', p.id, p.text) +
+      '</div>' +
+      '<p class="post-text">' + esc(p.text) + '</p>' +
+      '<div class="comments">' +
+        (comments.length ? comments.map(function (c) {
+          return '<div class="comment">' +
+            '<span class="c-name">' + esc(person(c.who).name) + '</span>' +
+            '<span class="c-text">' + esc(c.text) + '</span>' +
+            delButton('comments', c.id, c.text) +
+            '</div>';
+        }).join('') : '') +
+        '<div class="comment-row">' +
+          '<input class="input" data-post="' + p.id + '" data-enter="add-comment" maxlength="200"' +
+            ' placeholder="写句评论…" aria-label="评论" />' +
+          '<button class="btn btn-ghost btn-sm" data-action="add-comment" data-post="' + p.id + '">发送</button>' +
+        '</div>' +
+      '</div>' +
+      '</article>';
+  }
 
   function ledgerRow(e) {
     var income = e.amount > 0;
@@ -1582,6 +1712,7 @@
       '</div>' +
       '<span class="amount ' + (income ? 'in' : 'out') + '">' +
         (income ? '+' : '−') + num(Math.abs(e.amount)) + '</span>' +
+      delButton('ledger', e.id, e.title) +
       '</li>';
   }
 
@@ -1599,7 +1730,9 @@
       '<div class="wish-meta"><span>已存 ¥' + num(w.saved, 0) + '</span>' +
         '<span>目标 ¥' + num(w.target, 0) + '</span></div>' +
       '<div class="wish-meta"><span>' + pct + '%</span>' +
-        '<span>' + (done ? '已经实现啦' : '还差 ¥' + num(Math.max(0, w.target - w.saved), 0)) + '</span></div>' +
+        '<span style="display:flex;align-items:center;gap:4px">' +
+          (done ? '已经实现啦' : '还差 ¥' + num(Math.max(0, w.target - w.saved), 0)) +
+          delButton('wishes', w.id, w.title) + '</span></div>' +
       '</article>';
   }
 
@@ -1646,6 +1779,8 @@
     if (!root) return;
     if (app) app.hidden = true;
     closeDrawer();
+    var tb = document.getElementById('tabbar');
+    if (tb) tb.innerHTML = '';
     document.getElementById('modal-root').innerHTML = '';
     document.title = '登录 · 两人小日子';
     // 正在跟服务端核对「这个空间里有没有账号」，先别急着让人重新建号
@@ -1881,6 +2016,8 @@
     document.getElementById('sidebar').innerHTML = sidebar();
     document.getElementById('topbar').innerHTML = topbar();
     document.getElementById('view').innerHTML = v.render();
+    var tb = document.getElementById('tabbar');
+    if (tb) tb.innerHTML = tabbar();
     document.title = v.title + ' · 两人小日子';
   }
 
@@ -2033,6 +2170,88 @@
     if (!value) { toast('写一个心愿吧～'); return; }
     state.wishes.push({ id: uid('w'), emoji: '✨', title: value, target: 2000, saved: 0, status: '等你一起商量', updatedAt: Date.now() });
     saveState(); render(); toast('心愿已经放进清单了。');
+  }
+
+  function deleteRecord(kind, id) {
+    var rec = findRecord(kind, id);
+    if (!rec) return;
+    var label = rec.text || rec.title || rec.note || rec.who || '这条记录';
+    if (!window.confirm('删除「' + label + '」？\n两台设备都会一起删掉。')) return;
+    if (!killRecord(kind, id)) return;
+    saveState();
+    render();
+    toast('已经删掉了。');
+  }
+
+  function addLedgerFromForm() {
+    var titleEl = document.getElementById('new-ledger');
+    var amountEl = document.getElementById('new-ledger-amount');
+    var kindEl = document.getElementById('new-ledger-kind');
+    var title = titleEl ? titleEl.value.trim() : '';
+    var amount = Math.abs(parseFloat(amountEl && amountEl.value ? amountEl.value : '') || 0);
+    var income = !!(kindEl && kindEl.value === 'in');
+    if (!title) { toast('这笔钱是干嘛的？写一句吧。'); return; }
+    if (!amount) { toast('金额还没填。'); return; }
+    state.ledger.push({
+      id: uid('l'), title: title, cat: income ? '💰' : '💸',
+      who: currentName(), amount: income ? amount : -amount, day: 0, updatedAt: Date.now()
+    });
+    saveState(); render();
+    toast((income ? '记下一笔收入 ¥' : '记下一笔支出 ¥') + num(amount));
+  }
+
+  function addSavingFromForm() {
+    var el = document.getElementById('new-saving');
+    var amount = Math.abs(parseFloat(el && el.value ? el.value : '') || 0);
+    if (!amount) { toast('想存多少？填个数字。'); return; }
+    saveMoney(amount);
+  }
+
+  function addPostFromForm() {
+    var el = document.getElementById('new-post');
+    var text = el ? el.value.trim() : '';
+    if (!text) { toast('写点什么再发布吧。'); return; }
+    var now = new Date();
+    state.posts.push({
+      id: uid('p'), who: currentWho(), text: text, day: 0,
+      time: pad2(now.getHours()) + ':' + pad2(now.getMinutes()), updatedAt: Date.now()
+    });
+    saveState(); render();
+    toast('已经发出去了。');
+  }
+
+  function addCommentFrom(el) {
+    var postId = el && el.dataset ? el.dataset.post : '';
+    if (!postId) return;
+    var input = document.querySelector('[data-post="' + postId + '"][data-enter="add-comment"]');
+    var text = input ? input.value.trim() : '';
+    if (!text) { toast('写句评论吧。'); return; }
+    var now = new Date();
+    state.comments.push({
+      id: uid('c'), postId: postId, who: currentWho(), text: text, day: 0,
+      time: pad2(now.getHours()) + ':' + pad2(now.getMinutes()), updatedAt: Date.now()
+    });
+    saveState(); render();
+    toast('评论已经加上。');
+  }
+
+  function tabbar() {
+    var items = [
+      { view: 'overview', label: '总览', ic: 'grid' },
+      { view: 'todos', label: '待办', ic: 'listChecks' },
+      { view: 'ledger', label: '记账', ic: 'wallet' },
+      { view: 'posts', label: '说说', ic: 'message' },
+      { view: '__more', label: '更多', ic: 'menu' }
+    ];
+    return '<nav class="tabbar" aria-label="底部导航">' + items.map(function (it) {
+      var more = it.view === '__more';
+      var active = !more && state.view === it.view;
+      return '<button class="tab' + (active ? ' active' : '') + '"' +
+        ' data-action="' + (more ? 'open-drawer' : 'nav') + '"' +
+        (more ? '' : ' data-view="' + it.view + '"') +
+        ' aria-current="' + (active ? 'page' : 'false') + '">' +
+        icon(it.ic, 20) + '<span>' + it.label + '</span></button>';
+    }).join('') + '</nav>';
   }
 
   function setMood(who, mood) {
@@ -2202,6 +2421,21 @@
         break;
       case 'copy-setup':
         copySetupLink();
+        break;
+      case 'del':
+        deleteRecord(el.dataset.kind, el.dataset.id);
+        break;
+      case 'add-ledger':
+        addLedgerFromForm();
+        break;
+      case 'add-saving':
+        addSavingFromForm();
+        break;
+      case 'add-post':
+        addPostFromForm();
+        break;
+      case 'add-comment':
+        addCommentFrom(el);
         break;
       case 'change-pw':
         openPasswordModal();
