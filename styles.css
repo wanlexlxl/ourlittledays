@@ -1025,6 +1025,52 @@ pre.sql {
 }
 .auth-links { display: flex; gap: 14px; flex-wrap: wrap; }
 
+/* 装成 App 的自检面板 */
+.install-status {
+  padding: 14px 16px;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--border);
+  background: var(--bg-inset);
+}
+.install-status p {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  padding: 4px 0;
+  font-size: 12.5px; color: var(--text-dim);
+}
+.install-status b { color: var(--text-muted); font-weight: 600; text-align: right; }
+.install-steps {
+  margin: 8px 0 0 18px;
+  padding: 0;
+  list-style: decimal;
+  font-size: 12.5px; line-height: 1.9; color: var(--text-muted);
+}
+.install-steps li { margin-bottom: 2px; }
+.install-steps b { color: var(--text); font-weight: 600; }
+
+/* 建号页上的"先别建号"提醒 */
+.auth-warn {
+  margin-top: 16px;
+  padding: 14px 16px;
+  border-radius: var(--r-lg);
+  border: 1px solid rgba(240,164,106,.28);
+  background: rgba(240,164,106,.08);
+}
+.auth-warn > b {
+  display: block;
+  font-size: 13.5px; font-weight: 600;
+  color: var(--warm);
+}
+.auth-warn > span {
+  display: block; margin-top: 3px;
+  font-size: 11.5px; color: var(--text-dim);
+  word-break: break-all;
+}
+.auth-warn p { margin-top: 7px; font-size: 12.5px; line-height: 1.75; color: var(--text-muted); }
+.auth-warn p b { color: var(--text); font-weight: 600; }
+.auth-warn-actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+.auth-warn.is-bad { border-color: rgba(228,145,122,.35); background: rgba(228,145,122,.09); }
+.auth-warn.is-bad > b { color: var(--danger); }
+
 @media (max-width: 720px) {
   .sync-chip { height: 26px; padding: 0 8px; font-size: 11px; }
   .sync-chip { max-width: 96px; overflow: hidden; }

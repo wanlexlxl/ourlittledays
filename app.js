@@ -262,6 +262,8 @@
   var SYNC = {
     enabled: false,
     ready: false,        // 是否已经和服务端核对过一次
+    autoOk: false,       // 「跟随本页」时同源到底有没有 server.py
+    lastError: '',       // 最近一次同步失败的原因，方便排查
     status: 'local',     // local | syncing | ok | offline | needtoken | badkey
     rev: 0,
     dirty: false,
@@ -310,7 +312,7 @@
     return String(url || '').replace(/\/+$/, '');
   }
 
-  // auto：页面就是从自建服务（server.py）打开的，用同源接口
+  // auto：只有确认同源真的跑着 server.py 才用；静态托管上不会误判成"离线"
   // server：自己填一个地址（VPS、内网穿透都算）
   // supabase：免费云数据库，电脑不用开
   function activeMode() {
@@ -320,8 +322,7 @@
       return (cfg.sbUrl && cfg.sbKey && cfg.pass) ? 'supabase' : 'off';
     }
     if (cfg.mode === 'server') return cfg.url ? 'server' : 'off';
-    if (location.protocol === 'http:' || location.protocol === 'https:') return 'server';
-    return 'off';
+    return SYNC.autoOk ? 'server' : 'off';
   }
 
   function apiPath() {
@@ -578,15 +579,42 @@
     SYNC.cfg = loadSyncCfg();
     SYNC.token = SYNC.cfg.token || readToken();
     sbKeyCache = null;
-    SYNC.enabled = activeMode() !== 'off';
     SYNC.ready = false;
     SYNC.rev = 0;
     SYNC.snapshot = null;
     SYNC.dirty = false;
     SYNC.busy = false;
-    SYNC.status = SYNC.enabled ? 'syncing' : 'local';
+    SYNC.autoOk = false;
+    SYNC.lastError = '';
+
+    // 「跟随本页」模式：先探一下同源有没有 server.py。
+    // 放在 GitHub Pages 这类静态托管上时不应该被判成"离线"，而应该是"仅本机"。
+    if (SYNC.cfg.mode === 'auto' && (location.protocol === 'http:' || location.protocol === 'https:')) {
+      SYNC.enabled = false;
+      SYNC.status = 'local';
+      updateSyncChip();
+      fetch('api/ping', { cache: 'no-store' })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (res) {
+          SYNC.autoOk = !!(res && res.ok);
+          if (SYNC.autoOk) startSync();
+        })
+        .catch(function () { /* 没有同源服务，就保持"仅本机" */ });
+      return;
+    }
+    startSync();
+  }
+
+  function startSync() {
+    SYNC.enabled = activeMode() !== 'off';
+    if (!SYNC.enabled) {
+      SYNC.status = 'local';
+      updateSyncChip();
+      return;
+    }
+    SYNC.status = 'syncing';
+    SYNC.ready = false;
     updateSyncChip();
-    if (!SYNC.enabled) return;
     if (!SYNC.timer) {
       SYNC.timer = setInterval(tick, 5000);
       document.addEventListener('visibilitychange', function () {
@@ -607,9 +635,11 @@
   }
 
   function handleSyncError(err) {
-    var code = String(err && err.message);
+    var code = String(err && err.message ? err.message : err);
+    SYNC.lastError = code;
     if (code === 'DECRYPT_FAILED' || code === 'DECRYPT_FORMAT') setSyncStatus('badkey');
     else if (code !== 'NEED_TOKEN') setSyncStatus('offline');
+    updateSyncChip();
   }
 
   function pull(force) {
@@ -720,7 +750,7 @@
       local: '现在数据只保存在这台设备上。点「同步设置」接上云，两台手机就能看到同一份记录。',
       syncing: '正在同步…',
       ok: '两台设备看到的是一样的，改动会在几秒内互相出现。',
-      offline: '暂时连不上云端，改动已经存在本机，恢复后会自动补上去。',
+      offline: '暂时连不上云端' + (SYNC.lastError ? '（' + SYNC.lastError + '）' : '') + '，改动已经存在本机，恢复后会自动补上去。',
       needtoken: '服务端要求访问口令：到「同步设置」里填上。',
       badkey: '同步口令不对，云端的数据解不开。为了避免覆盖，已经停止上传。'
     };
@@ -885,6 +915,7 @@
           '<p class="sync-hint" id="sync-test-result">当前状态：' + (syncDraft.mode === 'off' ? '仅本机' : '待测试') + '</p>' +
           '<div class="modal-actions">' +
             shareBtn +
+            '<button class="btn btn-ghost" data-action="sync-diag">诊断</button>' +
             '<button class="btn btn-ghost" data-action="sync-test">' + icon('share', 15) + '测试连接</button>' +
             '<button class="btn btn-primary" data-action="sync-save">' + icon('check', 16) + '保存并同步</button>' +
           '</div>' +
@@ -1273,6 +1304,7 @@
         '<button class="side-link" data-action="export">' + icon('download', 16) + '<span>导出我们的记录</span></button>' +
         '<button class="side-link" data-action="import">' + icon('upload', 16) + '<span>导入记录</span></button>' +
         '<button class="side-link" data-action="sync-settings">' + icon('sliders', 16) + '<span>同步设置</span></button>' +
+        '<button class="side-link" data-action="install">' + icon('download', 16) + '<span>装成 App</span></button>' +
       '</div>' +
 
       '<button class="account" data-action="account" aria-haspopup="dialog">' +
@@ -1829,7 +1861,7 @@
   }
 
   function authSyncRow() {
-    if (!SYNC.enabled) return '';
+    // 登录页也显示同步状态：让新人一眼看出这台设备连没连上
     return '<div class="auth-sync">' + syncChip() + '</div>';
   }
 
@@ -1879,6 +1911,7 @@
 
     return '<div class="auth"><div class="auth-card">' + authBrand() +
       authSyncRow() +
+      authWarn() +
       '<h1 class="auth-title">先建一个只属于你们的空间</h1>' +
       '<p class="auth-sub">两个人各有一个账号，这样账本和心情才知道是谁记下的。' +
       '密码只保存在这台设备上，不会上传到任何服务器。</p>' +
@@ -1892,6 +1925,83 @@
         '<button class="btn btn-primary" data-action="auth-submit">' + icon('check', 16) + '创建并进入</button>' +
       '</div>' +
       '</div></div>';
+  }
+
+  // 建号页上的提醒：防止「云端明明有账号、只是没连上」的时候又建一套
+  function authWarn() {
+    var cfg = SYNC.cfg || loadSyncCfg();
+    var configured = !!(cfg.sbUrl || cfg.url);
+
+    if (SYNC.status === 'offline' || SYNC.status === 'needtoken' || SYNC.status === 'badkey') {
+      var why = {
+        offline: '连不上你们的云端',
+        needtoken: '云端需要访问口令',
+        badkey: '同步口令不对，解不开云端数据'
+      }[SYNC.status];
+      return '<div class="auth-warn is-bad">' +
+        '<b>' + why + '</b>' +
+        (SYNC.lastError ? '<span>' + esc(SYNC.lastError) + '</span>' : '') +
+        '<p>先别在下面建号。可能只是网络问题，过一会儿会自动重试；也可以点重试。</p>' +
+        '<div class="auth-warn-actions">' +
+          '<button class="btn btn-ghost btn-sm" data-action="sync-retry">重试连接</button>' +
+          '<button class="btn btn-ghost btn-sm" data-action="sync-settings">同步设置</button>' +
+        '</div>' +
+        '</div>';
+    }
+
+    if (!configured) {
+      return '<div class="auth-warn">' +
+        '<b>这台设备还没接上你们的空间</b>' +
+        '<p>如果空间已经建好了，先点「同步设置」填一次，或者让 TA 把「配置链接」发给你。' +
+        '<b>别急着在下面建号</b>——那会多出一套重复账号。</p>' +
+        '<div class="auth-warn-actions">' +
+          '<button class="btn btn-ghost btn-sm" data-action="sync-settings">去同步设置</button>' +
+        '</div>' +
+        '</div>';
+    }
+    return '';
+  }
+
+  /* --------------------------------------------------------- 同步自检 */
+
+  function runDiagnostics() {
+    var box = document.getElementById('sync-test-result');
+    var cfg = syncDraft || SYNC.cfg || loadSyncCfg();
+    function say(lines) {
+      if (!box) return;
+      box.style.whiteSpace = 'pre-wrap';
+      box.textContent = lines.join('\n');
+    }
+
+    var lines = [];
+    lines.push('网址：' + location.host + location.pathname);
+    lines.push('打开方式：' + (isStandalone() ? '主屏 App' : '浏览器') + ' · ' + location.protocol);
+    lines.push('安全上下文：' + (window.isSecureContext ? '是' : '否') +
+      ' · 加密 API：' + (sbReady() ? '可用' : '不可用'));
+    lines.push('同步方式：' + cfg.mode + ' · 配置完整：' +
+      (cfg.mode === 'supabase'
+        ? (cfg.sbUrl && cfg.sbKey && cfg.pass ? '是' : '否（URL/key/口令缺一个）')
+        : (cfg.mode === 'server' ? (cfg.url ? '是' : '跟随本页') : '—')));
+    lines.push('本机账号：' + accounts().length + ' 个 · 同一空间：' + (cfg.mode === 'supabase' ? sbSpaceId() : '—'));
+    lines.push('最近错误：' + (SYNC.lastError || '无'));
+    say(lines.concat(['', '正在测网络…']));
+
+    var checks = [];
+    checks.push(fetch('api/ping', { cache: 'no-store' })
+      .then(function (r) { return '同源 /api/ping → HTTP ' + r.status; })
+      .catch(function (e) { return '同源 /api/ping → 不通（' + e.message + '）'; }));
+
+    if (cfg.sbUrl && cfg.sbKey) {
+      checks.push(fetch(trimSlashes(cfg.sbUrl) + '/rest/v1/', {
+        cache: 'no-store',
+        headers: { 'apikey': cfg.sbKey, 'Authorization': 'Bearer ' + cfg.sbKey }
+      }).then(function (r) { return 'Supabase → HTTP ' + r.status; })
+        .catch(function (e) { return 'Supabase → 连不上（' + e.message + '）'; }));
+    }
+
+    Promise.all(checks).then(function (extra) {
+      say(lines.concat(extra));
+    });
   }
 
   function loginHtml() {
@@ -2493,6 +2603,96 @@
     toast('评论已经加上。');
   }
 
+  /* --------------------------------------------------- 装成 App（PWA） */
+
+  var installPrompt = null;
+
+  window.addEventListener('beforeinstallprompt', function (e) {
+    e.preventDefault();
+    installPrompt = e;
+  });
+  window.addEventListener('appinstalled', function () {
+    installPrompt = null;
+    toast('装好啦，桌面上的图标就是它。');
+  });
+
+  function isStandalone() {
+    if (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) return true;
+    return navigator.standalone === true;
+  }
+
+  function isIOSDevice() {
+    return /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  }
+
+  function swReadyText() {
+    if (!('serviceWorker' in navigator)) return '这个浏览器不支持离线缓存';
+    return navigator.serviceWorker.controller
+      ? '已启用（离线可用）'
+      : '已注册，刷新一次后生效';
+  }
+
+  function openInstallModal() {
+    var standalone = isStandalone();
+    var ios = isIOSDevice();
+    var steps = ios
+      ? '<ol class="install-steps">' +
+          '<li>用 <b>Safari</b> 打开这个网址（微信内置浏览器不行）</li>' +
+          '<li>点底部 <b>分享</b> 按钮 → <b>添加到主屏幕</b></li>' +
+          '<li>桌面上会出现三叶草图标，点开就是全屏</li>' +
+        '</ol>'
+      : '<ol class="install-steps">' +
+          '<li>点浏览器右上角的 <b>⋮</b>（或 <b>≡</b>）</li>' +
+          '<li>找 <b>「安装应用」</b> 或 <b>「添加到主屏幕」</b></li>' +
+          '<li>如果「安装应用」点了没反应：那是这台手机的系统拦住了安装包（国产安卓常见），' +
+            '改用 <b>「添加到主屏幕」</b> 建快捷方式就行，差别只是打开时可能有地址栏</li>' +
+        '</ol>';
+
+    document.getElementById('modal-root').innerHTML =
+      '<div class="modal-scrim" data-action="close-modal">' +
+        '<div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">' +
+          '<div class="modal-head">' +
+            '<div><h2 class="modal-title" id="modal-title">装成 App</h2>' +
+            '<p class="modal-sub">加到主屏幕后就没有地址栏了，数据还是同一份。</p></div>' +
+            '<button class="icon-btn" data-action="close-modal" aria-label="关闭">' + icon('x', 18) + '</button>' +
+          '</div>' +
+          '<div class="modal-body">' +
+            '<div class="install-status">' +
+              '<p><span>现在是不是 App 模式</span><b>' + (standalone ? '是，已经在全屏运行' : '不是，还在浏览器里') + '</b></p>' +
+              '<p><span>离线缓存</span><b>' + swReadyText() + '</b></p>' +
+              '<p><span>一键安装按钮</span><b>' + (standalone ? '—' : (installPrompt ? '可用' : '浏览器没给（用下面的方法）')) + '</b></p>' +
+            '</div>' +
+            (installPrompt && !standalone
+              ? '<div style="margin-top:16px">' +
+                  '<button class="btn btn-primary" data-action="install-app">' + icon('download', 16) + '安装到主屏幕</button>' +
+                '</div>'
+              : '') +
+            '<p class="sync-hint" style="margin-top:16px">手动装：</p>' +
+            steps +
+          '</div>' +
+          '<div class="modal-actions">' +
+            '<button class="btn btn-ghost" data-action="close-modal">知道了</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+  }
+
+  function installApp() {
+    if (!installPrompt) { toast('浏览器没给一键安装的入口，用下面的手动方法。'); return; }
+    var p = installPrompt;
+    installPrompt = null;
+    p.prompt();
+    if (p.userChoice) {
+      p.userChoice.then(function (res) {
+        if (res && res.outcome === 'accepted') toast('装好了。');
+        closeModal();
+      }).catch(function () { closeModal(); });
+    } else {
+      closeModal();
+    }
+  }
+
   function tabbar() {
     var items = [
       { view: 'overview', label: '总览', ic: 'grid' },
@@ -2745,6 +2945,19 @@
         break;
       case 'copy-media-sql':
         copyMediaSql();
+        break;
+      case 'sync-diag':
+        runDiagnostics();
+        break;
+      case 'sync-retry':
+        syncInit();
+        toast('正在重新连接…');
+        break;
+      case 'install':
+        openInstallModal();
+        break;
+      case 'install-app':
+        installApp();
         break;
       case 'change-pw':
         openPasswordModal();
