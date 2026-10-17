@@ -1120,6 +1120,45 @@ pre.sql {
 .comment-row .input { flex: 1; min-width: 0; height: 34px; font-size: 13px; }
 .comment-row .btn { flex: none; }
 
+/* 配图：发帖前的缩略图 + 帖子里的图片 */
+.composer-images { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.composer-images:empty { display: none; }
+.thumb {
+  position: relative;
+  width: 76px; height: 76px;
+  border-radius: 10px; overflow: hidden;
+  border: 1px solid var(--border);
+}
+.thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.thumb.uploading { opacity: .55; }
+.thumb-tip {
+  position: absolute; inset: 0;
+  display: grid; place-items: center;
+  font-size: 10px; color: var(--text);
+  background: rgba(0,0,0,.45);
+}
+.thumb-x {
+  position: absolute; top: 3px; right: 3px;
+  width: 18px; height: 18px; border-radius: 50%;
+  display: grid; place-items: center;
+  background: rgba(0,0,0,.7); color: #fff;
+  border: 1px solid rgba(255,255,255,.25);
+}
+.post-imgs { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.post-imgs a { display: block; line-height: 0; }
+.post-img {
+  max-width: 100%;
+  max-height: 240px;
+  width: auto;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  object-fit: cover;
+  background: rgba(255,255,255,.04);
+}
+@media (max-width: 480px) {
+  .post-img { max-height: 200px; }
+}
+
 @media (max-width: 480px) {
   .composer .btn { flex: 1 1 auto; justify-content: center; }
 }

@@ -41,6 +41,7 @@
     trash: '<path d="M3.5 6.5h17"/><path d="M8.5 6.5V4.8A1.8 1.8 0 0 1 10.3 3h3.4a1.8 1.8 0 0 1 1.8 1.8v1.7"/><path d="M18.5 6.5v12.7a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2V6.5"/><path d="M10 11v6"/><path d="M14 11v6"/>',
     message: '<path d="M21 11.6a8.6 8.6 0 0 1-9.2 8.6 9 9 0 0 1-3.9-.9L3 21l1.6-4.6A8.5 8.5 0 0 1 3.5 11 8.6 8.6 0 0 1 12 2.5h.4A8.6 8.6 0 0 1 21 11.1z"/>',
     send: '<path d="M21 3 10.5 13.5"/><path d="M21 3l-6.5 18-4-8.5L2 8.5 21 3z"/>',
+    image: '<rect x="3" y="4" width="18" height="16" rx="2.5"/><circle cx="8.6" cy="9.4" r="1.6"/><path d="m3.6 17.2 5-4.4 3.6 3 3-2.6 5.2 4.4"/>',
     sliders: '<path d="M4 6h9"/><path d="M17 6h3"/><path d="M4 12h3"/><path d="M11 12h9"/><path d="M4 18h7"/><path d="M15 18h5"/><circle cx="15" cy="6" r="2.2"/><circle cx="9" cy="12" r="2.2"/><circle cx="13" cy="18" r="2.2"/>',
     calendar: '<path d="M8 3v3.5"/><path d="M16 3v3.5"/><rect x="3.5" y="5" width="17" height="16" rx="2.5"/><path d="M3.5 10h17"/>',
     receipt: '<path d="M5 3.5 7 5l2-1.5L11 5l2-1.5L15 5l2-1.5 2 1.5v17l-2-1.4L15 22l-2-1.4L11 22l-2-1.4L7 22l-2-1.4z"/><path d="M8.5 9h7"/><path d="M8.5 13h7"/><path d="M8.5 16.5h4"/>',
@@ -779,6 +780,17 @@
     'create policy "little_days write"  on public.little_days for insert to anon with check (true);\n' +
     'create policy "little_days update" on public.little_days for update to anon using (true) with check (true);';
 
+  var MEDIA_SQL =
+    'insert into storage.buckets (id, name, public)\n' +
+    "values ('media', 'media', true)\n" +
+    'on conflict (id) do update set public = true;\n\n' +
+    'drop policy if exists "media upload" on storage.objects;\n' +
+    'create policy "media upload" on storage.objects\n' +
+    "  for insert to anon with check (bucket_id = 'media');\n\n" +
+    'drop policy if exists "media read" on storage.objects;\n' +
+    'create policy "media read" on storage.objects\n' +
+    "  for select to anon using (bucket_id = 'media');";
+
   function openSyncModal() {
     captureSyncForm();
     if (!syncDraft) syncDraft = JSON.parse(JSON.stringify(SYNC.cfg || loadSyncCfg()));
@@ -826,6 +838,17 @@
             '</div>' +
           '</details>' +
           '<p class="dim">上传前会用同步口令在本机加密（AES-GCM），云端只能看到乱码。</p>' +
+        '</div>' +
+        '<div class="sync-note">' +
+          '<details class="sync-help">' +
+            '<summary>想让「说说」能发图片？点开跑这段 SQL</summary>' +
+            '<div class="sync-help-body">' +
+              '<p><b>作用：</b>建一个公开的 <b>media</b> 桶，并允许当前 key 往里面传文件。' +
+              '图片压缩后传到 Supabase Storage，帖子里只存链接——所以同步数据不会被图片撑大。</p>' +
+              '<pre class="sql" id="media-sql">' + esc(MEDIA_SQL) + '</pre>' +
+              '<button class="btn btn-ghost btn-copy" data-action="copy-media-sql">' + icon('check', 14) + '复制图片用 SQL</button>' +
+            '</div>' +
+          '</details>' +
         '</div>';
     }
     if (syncDraft.mode === 'auto') {
@@ -929,6 +952,16 @@
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(text).then(function () {
         toast('SQL 已复制，粘贴到 Supabase 的 SQL Editor 里 Run。');
+      }).catch(function () { toast('复制失败，手动选中那段 SQL 吧。'); });
+    } else {
+      toast('这个环境不能自动复制，手动选中那段 SQL 吧。');
+    }
+  }
+
+  function copyMediaSql() {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(MEDIA_SQL).then(function () {
+        toast('图片用 SQL 已复制，粘贴到 SQL Editor 里 Run。');
       }).catch(function () { toast('复制失败，手动选中那段 SQL 吧。'); });
     } else {
       toast('这个环境不能自动复制，手动选中那段 SQL 吧。');
@@ -1549,6 +1582,7 @@
               '<p class="card-sub">写下来，就离实现近一点</p></div></div>' +
             '<div class="inline-form">' +
               '<input class="input" id="new-wish" data-enter="add-wish" placeholder="比如：一起去看一场演唱会" aria-label="新的心愿" />' +
+              '<input class="input num-input" id="new-wish-target" data-enter="add-wish" type="number" min="0" step="100" placeholder="目标金额" aria-label="目标金额" />' +
               '<button class="btn btn-primary" data-action="add-wish">' + icon('plus', 16) + '记下心愿</button>' +
             '</div>' +
           '</section>' +
@@ -1577,7 +1611,8 @@
                 '<p class="card-sub">已经存下 ¥' + num(saved, 0) + '，离目标还有 ¥' +
                   num(Math.max(0, state.saving.goal - saved), 0) + '</p>' +
                 '<div class="bar" style="margin:18px 0 14px"><i class="bar-fill" style="width:' + pct + '%"></i></div>' +
-                '<div class="wish-meta"><span>目标 ¥' + num(state.saving.goal, 0) + '</span><span>' + pct + '%</span></div>' +
+                '<div class="wish-meta"><span>目标 ¥' + num(state.saving.goal, 0) + '</span>' +
+                  '<button class="auth-link" data-action="goal">改目标</button></div>' +
                 '<div class="inline-form" style="margin-top:18px">' +
                   '<input class="input num-input" id="new-saving" data-enter="add-saving" type="number" min="0" step="1" placeholder="金额" aria-label="存入金额" />' +
                   '<button class="btn btn-primary" data-action="add-saving">' + icon('plus', 16) + '存进去</button>' +
@@ -1662,8 +1697,12 @@
               '<span class="avatar">' + me.emoji + '</span>' +
               '<input class="input" id="new-post" data-enter="add-post" maxlength="300"' +
                 ' placeholder="此刻想和你说点什么？" aria-label="新的说说" />' +
+              '<button class="btn btn-ghost btn-sm" data-action="pick-image" title="添加图片">' +
+                icon('image', 16) + '图片</button>' +
               '<button class="btn btn-primary" data-action="add-post">' + icon('send', 15) + '发布</button>' +
             '</div>' +
+            '<div class="composer-images" id="post-images"></div>' +
+            '<input type="file" id="post-image-input" accept="image/*" multiple hidden />' +
           '</section>' +
           (list.length
             ? '<section class="feed">' + list.map(postCard).join('') + '</section>'
@@ -1684,7 +1723,13 @@
         '</div>' +
         delButton('posts', p.id, p.text) +
       '</div>' +
-      '<p class="post-text">' + esc(p.text) + '</p>' +
+      (p.text ? '<p class="post-text">' + esc(p.text) + '</p>' : '') +
+      (p.images && p.images.length
+        ? '<div class="post-imgs">' + p.images.map(function (u) {
+            return '<a href="' + esc(u) + '" target="_blank" rel="noopener">' +
+              '<img class="post-img" src="' + esc(u) + '" loading="lazy" alt="图片" /></a>';
+          }).join('') + '</div>'
+        : '') +
       '<div class="comments">' +
         (comments.length ? comments.map(function (c) {
           return '<div class="comment">' +
@@ -2168,8 +2213,11 @@
     if (!el) return;
     var value = el.value.trim();
     if (!value) { toast('写一个心愿吧～'); return; }
-    state.wishes.push({ id: uid('w'), emoji: '✨', title: value, target: 2000, saved: 0, status: '等你一起商量', updatedAt: Date.now() });
-    saveState(); render(); toast('心愿已经放进清单了。');
+    var targetEl = document.getElementById('new-wish-target');
+    var target = Math.abs(parseFloat(targetEl && targetEl.value ? targetEl.value : '') || 0);
+    if (!target) target = 2000;
+    state.wishes.push({ id: uid('w'), emoji: '✨', title: value, target: target, saved: 0, status: '等你一起商量', updatedAt: Date.now() });
+    saveState(); render(); toast('心愿已经放进清单了，目标 ¥' + num(target, 0) + '。');
   }
 
   function deleteRecord(kind, id) {
@@ -2210,14 +2258,201 @@
   function addPostFromForm() {
     var el = document.getElementById('new-post');
     var text = el ? el.value.trim() : '';
-    if (!text) { toast('写点什么再发布吧。'); return; }
+    if (pendingImages.some(function (i) { return i.uploading; })) {
+      toast('还有图片在上传，等一秒再发。');
+      return;
+    }
+    var images = pendingImages.map(function (i) { return i.url; })
+      .filter(function (u) { return u && u.indexOf('blob:') !== 0; });
+    if (!text && !images.length) { toast('写点什么或者加张图再发布吧。'); return; }
     var now = new Date();
     state.posts.push({
-      id: uid('p'), who: currentWho(), text: text, day: 0,
+      id: uid('p'), who: currentWho(), text: text, images: images, day: 0,
       time: pad2(now.getHours()) + ':' + pad2(now.getMinutes()), updatedAt: Date.now()
     });
+    pendingImages = [];
     saveState(); render();
-    toast('已经发出去了。');
+    toast(images.length ? '发出去了，' + images.length + ' 张图。' : '已经发出去了。');
+  }
+
+  /* --------------------------------------------------------- 说说配图 */
+
+  var pendingImages = [];
+
+  function compressOnce(file, maxSide, quality) {
+    return new Promise(function (resolve, reject) {
+      var url = URL.createObjectURL(file);
+      var img = new Image();
+      img.onload = function () {
+        try {
+          var scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+          var w = Math.max(1, Math.round(img.width * scale));
+          var h = Math.max(1, Math.round(img.height * scale));
+          var canvas = document.createElement('canvas');
+          canvas.width = w;
+          canvas.height = h;
+          canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+          canvas.toBlob(function (blob) {
+            URL.revokeObjectURL(url);
+            if (blob) resolve(blob); else reject(new Error('no blob'));
+          }, 'image/jpeg', quality);
+        } catch (err) {
+          URL.revokeObjectURL(url);
+          reject(err);
+        }
+      };
+      img.onerror = function () {
+        URL.revokeObjectURL(url);
+        reject(new Error('load failed'));
+      };
+      img.src = url;
+    });
+  }
+
+  // 手机原图动辄几 MB，先压到能传的大小
+  function compressImage(file) {
+    return compressOnce(file, 1400, 0.72).then(function (blob) {
+      if (blob && blob.size > 450 * 1024) return compressOnce(file, 1000, 0.58);
+      return blob;
+    });
+  }
+
+  function blobToDataUrl(blob) {
+    return new Promise(function (resolve, reject) {
+      var fr = new FileReader();
+      fr.onload = function () { resolve(String(fr.result)); };
+      fr.onerror = function () { reject(new Error('read failed')); };
+      fr.readAsDataURL(blob);
+    });
+  }
+
+  function uploadToStorage(blob) {
+    var cfg = SYNC.cfg;
+    var bucket = cfg.mediaBucket || 'media';
+    var name = 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8) + '.jpg';
+    var base = trimSlashes(cfg.sbUrl);
+    return fetch(base + '/storage/v1/object/' + bucket + '/' + name, {
+      method: 'POST',
+      headers: {
+        'apikey': cfg.sbKey,
+        'Authorization': 'Bearer ' + cfg.sbKey,
+        'Content-Type': 'image/jpeg',
+        'x-upsert': 'false',
+        'cache-control': 'max-age=31536000'
+      },
+      body: blob
+    }).then(function (res) {
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return base + '/storage/v1/object/public/' + bucket + '/' + name;
+    });
+  }
+
+  // 配了 Supabase 就传到 Storage（帖子里只存链接，同步数据不会被图片撑大）；
+  // 没配就退化成内联 base64，只在这台设备看得到。
+  function saveImage(blob) {
+    var cfg = SYNC.cfg || {};
+    if (activeMode() === 'supabase' && cfg.sbUrl && cfg.sbKey) {
+      return uploadToStorage(blob).catch(function (err) {
+        if (window.console) console.warn('图片上传失败，改成存本机。', err);
+        toast('图片没传上云，先存在这台设备了。');
+        return blobToDataUrl(blob);
+      });
+    }
+    return blobToDataUrl(blob);
+  }
+
+  function renderPendingImages() {
+    var box = document.getElementById('post-images');
+    if (!box) return;
+    box.innerHTML = pendingImages.map(function (it, i) {
+      return '<div class="thumb' + (it.uploading ? ' uploading' : '') + '">' +
+        '<img src="' + esc(it.url) + '" alt="" />' +
+        (it.uploading ? '<span class="thumb-tip">上传中…</span>' : '') +
+        '<button class="thumb-x" data-action="drop-image" data-i="' + i + '" aria-label="移除图片">' +
+        icon('x', 12) + '</button></div>';
+    }).join('');
+  }
+
+  function pickImage() {
+    var input = document.getElementById('post-image-input');
+    if (input) input.click();
+  }
+
+  function onImagePicked(input) {
+    var files = Array.prototype.slice.call(input.files || [])
+      .filter(function (f) { return /^image\//.test(f.type); });
+    input.value = '';
+    if (!files.length) return;
+    if (pendingImages.length + files.length > 3) {
+      toast('一条说说最多 3 张图。');
+      return;
+    }
+    files.forEach(function (file) {
+      var item = { url: URL.createObjectURL(file), uploading: true };
+      pendingImages.push(item);
+      renderPendingImages();
+      compressImage(file).then(function (blob) {
+        return saveImage(blob).then(function (finalUrl) {
+          item.url = finalUrl;
+          item.uploading = false;
+          renderPendingImages();
+        });
+      }).catch(function () {
+        item.uploading = false;
+        renderPendingImages();
+        toast('这张图没处理成功，换一张试试。');
+      });
+    });
+  }
+
+  function dropImage(index) {
+    var i = Number(index);
+    if (isNaN(i) || !pendingImages[i]) return;
+    pendingImages.splice(i, 1);
+    renderPendingImages();
+  }
+
+  /* ------------------------------------------------------- 改存钱目标 */
+
+  function openGoalModal() {
+    var goal = state.saving.goal || 20000;
+    document.getElementById('modal-root').innerHTML =
+      '<div class="modal-scrim" data-action="close-modal">' +
+        '<div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">' +
+          '<div class="modal-head">' +
+            '<div><h2 class="modal-title" id="modal-title">改存钱目标</h2>' +
+            '<p class="modal-sub">两个人共用一个目标，改了会同步到另一台设备。</p></div>' +
+            '<button class="icon-btn" data-action="close-modal" aria-label="关闭">' + icon('x', 18) + '</button>' +
+          '</div>' +
+          '<div class="modal-body">' +
+            '<div class="field" style="margin-bottom:0"><label for="goal-input">目标金额（元）</label>' +
+              '<input class="input" id="goal-input" type="number" min="1" step="100" value="' + goal + '" data-enter="save-goal" /></div>' +
+            '<p class="auth-error" id="goal-error"></p>' +
+          '</div>' +
+          '<div class="modal-actions">' +
+            '<button class="btn btn-ghost" data-action="close-modal">取消</button>' +
+            '<button class="btn btn-primary" data-action="save-goal">' + icon('check', 16) + '保存目标</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+    var el = document.getElementById('goal-input');
+    if (el) { el.focus(); el.select(); }
+  }
+
+  function saveGoal() {
+    var el = document.getElementById('goal-input');
+    var v = Math.abs(parseFloat(el && el.value ? el.value : '') || 0);
+    if (!v || v < 1) {
+      var errBox = document.getElementById('goal-error');
+      if (errBox) errBox.textContent = '填一个大于 0 的金额。';
+      toast('填一个大于 0 的金额。');
+      return;
+    }
+    state.saving.goal = Math.round(v);
+    saveState();
+    closeModal();
+    render();
+    toast('目标改成 ¥' + num(state.saving.goal, 0) + ' 了。');
   }
 
   function addCommentFrom(el) {
@@ -2437,6 +2672,21 @@
       case 'add-comment':
         addCommentFrom(el);
         break;
+      case 'pick-image':
+        pickImage();
+        break;
+      case 'drop-image':
+        dropImage(el.dataset.i);
+        break;
+      case 'goal':
+        openGoalModal();
+        break;
+      case 'save-goal':
+        saveGoal();
+        break;
+      case 'copy-media-sql':
+        copyMediaSql();
+        break;
       case 'change-pw':
         openPasswordModal();
         break;
@@ -2523,6 +2773,10 @@
     if (!pendingRender) return;
     pendingRender = false;
     setTimeout(render, 0);
+  });
+
+  document.addEventListener('change', function (ev) {
+    if (ev.target && ev.target.id === 'post-image-input') onImagePicked(ev.target);
   });
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
