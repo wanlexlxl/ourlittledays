@@ -837,8 +837,12 @@ svg { display: block; flex: none; }
   position: fixed; inset: 0; z-index: 65;
   background: rgba(6,8,6,.6);
   backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
   animation: fade .18s var(--ease) both;
 }
+
+/* 抽屉打开时锁住背后的页面，避免滑动穿透 */
+body.drawer-lock { overflow: hidden; }
 
 /* ============================ 登录 / 建号 ============================ */
 

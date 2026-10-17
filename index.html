@@ -20,9 +20,11 @@
     <header class="topbar" id="topbar"></header>
     <main class="content" id="view" tabindex="-1"></main>
   </div>
+  <!-- 抽屉遮罩必须放在 .app 里面：.app 有 z-index:1 会形成层叠上下文，
+       放外面的话遮罩会盖住整个 app（连抽屉一起被 backdrop-filter 糊掉） -->
+  <div class="scrim" id="scrim" data-action="close-drawer" hidden></div>
 </div>
 
-<div class="scrim" id="scrim" data-action="close-drawer" hidden></div>
 <div class="toast-wrap" id="toast" aria-live="polite" aria-atomic="true"></div>
 <div id="modal-root"></div>
 

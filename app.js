@@ -1645,6 +1645,7 @@
     var root = document.getElementById('auth-root');
     if (!root) return;
     if (app) app.hidden = true;
+    closeDrawer();
     document.getElementById('modal-root').innerHTML = '';
     document.title = '登录 · 两人小日子';
     // 正在跟服务端核对「这个空间里有没有账号」，先别急着让人重新建号
@@ -2116,6 +2117,7 @@
   function openDrawer() {
     document.getElementById('app').classList.add('drawer-open');
     document.getElementById('scrim').hidden = false;
+    document.body.classList.add('drawer-lock');
   }
 
   function closeDrawer() {
@@ -2123,6 +2125,7 @@
     if (app) app.classList.remove('drawer-open');
     var scrim = document.getElementById('scrim');
     if (scrim) scrim.hidden = true;
+    document.body.classList.remove('drawer-lock');
   }
 
   /* ------------------------------------------------------------- 事件 */
