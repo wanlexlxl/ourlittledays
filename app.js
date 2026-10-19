@@ -127,7 +127,98 @@
   }
 
   function uid(prefix) {
-    return (prefix || 'x') + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    return (prefix || 'x') + (window.crypto && window.crypto.randomUUID
+      ? window.crypto.randomUUID() : Date.now().toString(36) + randomSalt());
+  }
+
+  function money(value) {
+    var n = Number(value);
+    return Number.isFinite(n) && n > 0 && n <= 1000000000 ? Math.round(n * 100) / 100 : 0;
+  }
+
+  function validDay(value) {
+    if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+    var d = new Date(value + 'T12:00:00');
+    return !isNaN(d.getTime()) && isoDay(d) === value;
+  }
+
+  function editTime(rec) { return Math.max(Date.now(), Number(rec && rec.updatedAt || 0) + 1); }
+
+  function safeImageUrl(url) {
+    return typeof url === 'string' && (/^https?:\/\//i.test(url) || /^data:image\/(jpeg|png|webp|gif);base64,[a-z0-9+/=]+$/i.test(url));
+  }
+
+  var LIST_KEYS = ['todos', 'ledger', 'wishes', 'savingsLog', 'moods', 'posts', 'comments'];
+
+  // 所有入口共用校验；旧版相对日期只迁移一次，之后固定保存。
+  function normalizeData(input) {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('INVALID_DATA');
+    var data = JSON.parse(JSON.stringify(input));
+    var anchor = validDay(String(data.exportedAt || '').slice(0, 10))
+      ? new Date(String(data.exportedAt).slice(0, 10) + 'T12:00:00') : today();
+    function records(list) {
+      if (!Array.isArray(list)) throw new Error('INVALID_DATA');
+      return list.map(function (r) {
+        if (!r || typeof r !== 'object' || Array.isArray(r) || typeof r.id !== 'string' ||
+            !/^[a-z0-9_-]{1,128}$/i.test(r.id)) throw new Error('INVALID_DATA');
+        Object.keys(r).forEach(function (k) {
+          if (['images'].indexOf(k) < 0 && r[k] !== null && typeof r[k] === 'object') throw new Error('INVALID_DATA');
+        });
+        ['text', 'title', 'name', 'emoji', 'cat', 'who', 'mood', 'note', 'time', 'tag', 'when', 'status', 'postId', 'wishId', 'hash', 'salt'].forEach(function (k) {
+          if (r[k] !== undefined && typeof r[k] !== 'string') throw new Error('INVALID_DATA');
+        });
+        ['amount', 'target', 'saved', 'savedBase', 'updatedAt', 'day'].forEach(function (k) {
+          if (r[k] !== undefined && (typeof r[k] !== 'number' || !Number.isFinite(r[k]))) throw new Error('INVALID_DATA');
+        });
+        ['done', 'deleted'].forEach(function (k) {
+          if (r[k] !== undefined && typeof r[k] !== 'boolean') throw new Error('INVALID_DATA');
+        });
+        if (r.images !== undefined && (!Array.isArray(r.images) || r.images.some(function (u) { return !safeImageUrl(u); }))) throw new Error('INVALID_DATA');
+        return r;
+      });
+    }
+    LIST_KEYS.forEach(function (key) {
+      data[key] = records(data[key] === undefined ? [] : data[key]);
+      data[key].forEach(function (r) {
+        if (key === 'ledger' && (typeof r.amount !== 'number' || !r.amount || Math.abs(r.amount) > 1000000000)) throw new Error('INVALID_DATA');
+        if (key === 'savingsLog' && !money(r.amount)) throw new Error('INVALID_DATA');
+        if (key === 'wishes' && !money(r.target)) throw new Error('INVALID_DATA');
+        if (key === 'todos' && !r.text && !r.deleted) throw new Error('INVALID_DATA');
+        if (key === 'moods' && !r.mood) throw new Error('INVALID_DATA');
+        if (key === 'comments' && (!r.postId || !r.text)) throw new Error('INVALID_DATA');
+        if (key === 'posts' && !r.deleted && !r.text && !(r.images && r.images.length)) throw new Error('INVALID_DATA');
+        if (key !== 'todos' && key !== 'wishes' && !validDay(r.date)) {
+          var d = r.updatedAt ? new Date(r.updatedAt) : new Date(anchor);
+          d.setDate(d.getDate() + (r.day || 0));
+          r.date = isoDay(d);
+        }
+        if (key === 'todos' && !validDay(r.dueDate) && (r.when === '今天' || r.when === '明天')) {
+          var due = new Date(anchor);
+          due.setDate(due.getDate() + (r.when === '明天' ? 1 : 0));
+          r.dueDate = isoDay(due);
+        }
+      });
+    });
+    data.auth = data.auth || { accounts: [], currentId: null };
+    data.auth.accounts = records(data.auth.accounts || []);
+    if (data.auth.accounts.some(function (a) { return !a.name || !a.salt || !a.hash; })) throw new Error('INVALID_DATA');
+    var saving = data.saving || {};
+    data.saving = { goal: money(saving.goal) || 20000, updatedAt: Number(saving.updatedAt) || 0, saved: 0 };
+    recalculateSavings(data);
+    return data;
+  }
+
+  function recalculateSavings(data) {
+    var logs = (data.savingsLog || []).filter(function (l) { return !l.deleted; });
+    data.saving.saved = Math.round(logs.reduce(function (s, l) { return s + (l.amount || 0); }, 0) * 100) / 100;
+    (data.wishes || []).forEach(function (w) {
+      var total = logs.filter(function (l) { return l.wishId === w.id; })
+        .reduce(function (s, l) { return s + (l.amount || 0); }, 0);
+      if (w.savedBase === undefined) w.savedBase = Math.max(0, (w.saved || 0) - total);
+      w.saved = Math.round((w.savedBase + total) * 100) / 100;
+      w.status = w.target > 0 && w.saved >= w.target ? '已完成'
+        : w.saved > 0 || w.status === '已完成' ? '进行中' : (w.status || '等你一起商量');
+    });
   }
 
   /* ------------------------------------------------------------ 账号密码 */
@@ -174,76 +265,12 @@
   /* ------------------------------------------------------------ 初始数据 */
 
   function seed() {
-    // 所有示例记录的 day 都是「距今几天」，并收敛到本月内，保证首次打开时数据好看
-    var monthRoom = Math.max(1, today().getDate() - 1);
-    var ago = function (n) { return -Math.min(n, monthRoom); };
-
-    var data = {
+    return {
       view: 'overview',
       auth: { accounts: [], currentId: null },
-      todos: [
-        { id: 't1', text: '一起去超市补充冰箱', when: '今天', tag: '一起', done: false },
-        { id: 't2', text: '把阳台的花浇一下', when: '今天', tag: '一起', done: false },
-        { id: 't3', text: '一起做一顿晚饭', when: '今天', tag: '一起', done: false },
-        { id: 't4', text: '帮小雅取快递', when: '明天', tag: '小熙', done: false },
-        { id: 't5', text: '整理上个月的照片', when: '本周', tag: '一起', done: true }
-      ],
-      ledger: [
-        { id: 'l1', title: '楼下咖啡', cat: '☕', who: '小熙', amount: -32, day: 0 },
-        { id: 'l2', title: '路边的花', cat: '💐', who: '小熙', amount: -46.5, day: 0 },
-        { id: 'l3', title: '两个人的早餐', cat: '🥐', who: '小雅', amount: -18, day: 0 },
-        { id: 'l4', title: '地铁', cat: '🚇', who: '小熙', amount: -6, day: 0 },
-        { id: 'l5', title: '水果', cat: '🍑', who: '小雅', amount: -24, day: 0 },
-        { id: 'l6', title: '外卖晚餐', cat: '🍜', who: '小雅', amount: -121, day: ago(1) },
-        { id: 'l7', title: '超市采购', cat: '🛒', who: '小熙', amount: -386.4, day: ago(2) },
-        { id: 'l8', title: '电影票两张', cat: '🎬', who: '小雅', amount: -98, day: ago(4) },
-        { id: 'l9', title: '日用品', cat: '🧴', who: '小熙', amount: -148.6, day: ago(6) },
-        { id: 'l10', title: '水电燃气', cat: '💡', who: '小熙', amount: -180, day: ago(8) },
-        { id: 'l11', title: '房租', cat: '🏠', who: '小熙', amount: -1800, day: ago(11) },
-        { id: 'l12', title: '小雅的工资', cat: '💰', who: '小雅', amount: 12000, day: ago(9) }
-      ],
-      wishes: [
-        { id: 'w1', emoji: '🏝️', title: '一起去看海', target: 6000, saved: 2400, status: '进行中' },
-        { id: 'w2', emoji: '📷', title: '买一台拍立得', target: 1200, saved: 1200, status: '已完成' },
-        { id: 'w3', emoji: '🎂', title: '给小雅过生日', target: 2000, saved: 600, status: '等你一起商量' },
-        { id: 'w4', emoji: '🪴', title: '阳台改造成小花园', target: 3000, saved: 1200, status: '进行中' }
-      ],
-      saving: { goal: 20000, saved: 6800 },
-      savingsLog: [
-        { id: 's1', who: '小熙', amount: 1000, day: ago(6) },
-        { id: 's2', who: '小雅', amount: 800, day: ago(13) },
-        { id: 's3', who: '小熙', amount: 5000, day: ago(21) }
-      ],
-      moods: [
-        { id: 'm1', day: 0, who: 'a', mood: '🥰', note: '有你在的日子，普通也很甜。', time: '12:40' },
-        { id: 'm2', day: 0, who: 'b', mood: '🙂', note: '今天有点累，但回家看到你就好了。', time: '21:05' },
-        { id: 'm3', day: ago(1), who: 'a', mood: '😄', note: '晚上一起做了番茄意面，意外地成功。', time: '22:10' },
-        { id: 'm4', day: ago(2), who: 'b', mood: '😴', note: '加班到很晚，先睡啦。', time: '23:40' },
-        { id: 'm5', day: ago(3), who: 'a', mood: '🙂', note: '阴天，适合窝在沙发上看剧。', time: '20:15' },
-        { id: 'm6', day: ago(5), who: 'b', mood: '😤', note: '为一颗葱吵了两句，五分钟就和好了。', time: '19:30' }
-      ],
-      posts: [
-        { id: 'p1', who: 'a', text: '今天顺手买了一束花，放在餐桌上了。', day: 0, time: '20:10' },
-        { id: 'p2', who: 'b', text: '下班路上看到晚霞，拍下来给你看（虽然拍得很糊）。', day: -1, time: '18:42' }
-      ],
-      comments: [
-        { id: 'c1', postId: 'p1', who: 'b', text: '好看！明天换我买。', day: 0, time: '20:15' },
-        { id: 'c2', postId: 'p2', who: 'a', text: '糊也好看，因为是你拍的。', day: -1, time: '19:00' }
-      ]
+      todos: [], ledger: [], wishes: [], savingsLog: [], moods: [], posts: [], comments: [],
+      saving: { goal: 20000, saved: 0, updatedAt: 0 }
     };
-
-    // 示例数据用的是相对天数，这里把它落成绝对日期，免得第二天还显示"今天"
-    var dayDate = function (offset) {
-      var d = today();
-      d.setDate(d.getDate() + offset);
-      return isoDay(d);
-    };
-    ['ledger', 'savingsLog', 'moods', 'posts', 'comments'].forEach(function (key) {
-      (data[key] || []).forEach(function (rec) {
-        if (rec && !rec.date && typeof rec.day === 'number') rec.date = dayDate(rec.day);
-      });
-    });
-    return data;
   }
 
   var MOODS = [
@@ -264,22 +291,28 @@
     try {
       var raw = localStorage.getItem(CONFIG.storageKey);
       if (!raw) return base;
-      var saved = JSON.parse(raw);
+      var saved = normalizeData(JSON.parse(raw));
       Object.keys(saved).forEach(function (k) {
         if (saved[k] !== undefined && saved[k] !== null) base[k] = saved[k];
       });
+      try { localStorage.setItem(CONFIG.storageKey, JSON.stringify(base)); } catch (err) { /* 保存时会再提示 */ }
     } catch (err) {
-      if (window.console) console.warn('本地数据读取失败，已回到示例数据。', err);
+      if (window.console) console.warn('本地数据读取失败，原始文件仍保留。', err);
+      // 不自动覆盖损坏的原始数据，留出导出或人工恢复的机会。
+      setTimeout(function () { window.alert('本机记录读取失败。请先备份浏览器中的原始数据，再重新载入；当前页面已停止保存和同步。'); }, 0);
+      base.readError = true;
     }
     return base;
   }
 
   function saveState() {
-    state.saving.saved = savedTotal();
+    if (state.readError) { toast('本机数据读取失败，请先备份恢复。'); return; }
+    recalculateSavings(state);
     try {
       localStorage.setItem(CONFIG.storageKey, JSON.stringify(state));
     } catch (err) {
       if (window.console) console.warn('本地数据保存失败。', err);
+      toast('本机保存失败（空间不足或浏览器限制），请立即导出备份。');
     }
     markDirty();
   }
@@ -302,7 +335,9 @@
     token: '',
     snapshot: null,      // 上一次确认「服务端已经拿到」的数据快照
     lastAt: 0,
-    cfg: null
+    cfg: null,
+    epoch: 0,
+    verified: false
   };
 
   var CLIENT_ID = uid('c');
@@ -312,7 +347,7 @@
   var SYNC_CFG_KEY = CONFIG.storageKey + ':sync';
 
   function defaultSyncCfg() {
-    return { mode: 'auto', url: '', token: '', sbUrl: '', sbKey: '', pass: '' };
+    return { mode: 'auto', url: '', token: '', sbUrl: '', sbKey: '', pass: '', accessToken: '' };
   }
 
   function loadSyncCfg() {
@@ -344,8 +379,8 @@
   // auto：只有确认同源真的跑着 server.py 才用；静态托管上不会误判成"离线"
   // server：自己填一个地址（VPS、内网穿透都算）
   // supabase：免费云数据库，电脑不用开
-  function activeMode() {
-    var cfg = SYNC.cfg || defaultSyncCfg();
+  function activeMode(settings) {
+    var cfg = settings || SYNC.cfg || defaultSyncCfg();
     if (cfg.mode === 'off') return 'off';
     if (cfg.mode === 'supabase') {
       return (cfg.sbUrl && cfg.sbKey && cfg.pass) ? 'supabase' : 'off';
@@ -354,8 +389,8 @@
     return SYNC.autoOk ? 'server' : 'off';
   }
 
-  function apiPath() {
-    var cfg = SYNC.cfg || defaultSyncCfg();
+  function apiPath(settings) {
+    var cfg = settings || SYNC.cfg || defaultSyncCfg();
     if (cfg.mode === 'server' && cfg.url) return trimSlashes(cfg.url) + '/api/state';
     return 'api/state';
   }
@@ -376,8 +411,8 @@
     return ('0000000' + h.toString(16)).slice(-8);
   }
 
-  function sbSpaceId() {
-    var cfg = SYNC.cfg || defaultSyncCfg();
+  function sbSpaceId(settings) {
+    var cfg = settings || SYNC.cfg || defaultSyncCfg();
     var seed = trimSlashes(cfg.sbUrl) + '|' + cfg.pass;
     return 'space-' + fnv1a(seed) + fnv1a(seed.split('').reverse().join(''));
   }
@@ -398,8 +433,9 @@
   var sbKeyCache = null;
 
   function deriveKey(pass, space) {
-    if (sbKeyCache) return sbKeyCache;
-    sbKeyCache = window.crypto.subtle.importKey(
+    var identity = pass + '\n' + space;
+    if (sbKeyCache && sbKeyCache.identity === identity) return sbKeyCache.promise;
+    var promise = window.crypto.subtle.importKey(
       'raw', new TextEncoder().encode(pass), 'PBKDF2', false, ['deriveKey']
     ).then(function (base) {
       return window.crypto.subtle.deriveKey(
@@ -407,11 +443,13 @@
         base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
       );
     });
-    return sbKeyCache;
+    sbKeyCache = { identity: identity, promise: promise };
+    return promise;
   }
 
-  function encryptJson(obj) {
-    return deriveKey(SYNC.cfg.pass, sbSpaceId()).then(function (key) {
+  function encryptJson(obj, settings) {
+    var cfg = settings || SYNC.cfg;
+    return deriveKey(cfg.pass, sbSpaceId(cfg)).then(function (key) {
       var iv = window.crypto.getRandomValues(new Uint8Array(12));
       return window.crypto.subtle.encrypt(
         { name: 'AES-GCM', iv: iv }, key, new TextEncoder().encode(JSON.stringify(obj))
@@ -421,10 +459,11 @@
     });
   }
 
-  function decryptJson(text) {
+  function decryptJson(text, settings) {
+    var cfg = settings || SYNC.cfg;
     var parts = String(text || '').split('.');
     if (parts.length !== 2) return Promise.reject(new Error('DECRYPT_FORMAT'));
-    return deriveKey(SYNC.cfg.pass, sbSpaceId()).then(function (key) {
+    return deriveKey(cfg.pass, sbSpaceId(cfg)).then(function (key) {
       return window.crypto.subtle.decrypt(
         { name: 'AES-GCM', iv: b64ToBytes(parts[0]) }, key, b64ToBytes(parts[1])
       ).then(function (buf) {
@@ -439,7 +478,6 @@
 
   function jsonOrThrow(res) {
     if (res.status === 401 || res.status === 403) {
-      setSyncStatus('needtoken');
       throw new Error('NEED_TOKEN');
     }
     if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -449,7 +487,7 @@
   // 带超时的 fetch：网络被墙/丢包时 fetch 会一直挂着不返回，
   // 没有这个保护界面就会永远停在「同步中」，而且不会再重试。
   function fetchWithTimeout(url, options, ms) {
-    var opts = options || {};
+    var opts = Object.assign({}, options || {});
     var limit = ms || 12000;
     if (typeof AbortController === 'undefined') return fetch(url, opts);
     var ctrl = new AbortController();
@@ -459,6 +497,12 @@
     opts.signal = ctrl.signal;
     if (!opts.cache) opts.cache = 'no-store';
     return fetch(url, opts).then(function (res) {
+      // 超时覆盖响应体下载，避免收到响应头后仍无限等待 JSON。
+      return res.text().then(function (body) {
+        return new Response([204, 205, 304].indexOf(res.status) >= 0 ? null : body,
+          { status: res.status, statusText: res.statusText, headers: res.headers });
+      });
+    }).then(function (res) {
       clearTimeout(timer);
       return res;
     }, function (err) {
@@ -470,95 +514,130 @@
     });
   }
 
-  function sbHeaders(extra) {
-    var cfg = SYNC.cfg;
-    var head = {
-      'apikey': cfg.sbKey,
-      'Authorization': 'Bearer ' + cfg.sbKey,
-      'Accept': 'application/json'
-    };
+  function sbHeaders(extra, settings) {
+    var cfg = settings || SYNC.cfg;
+    var head = { apikey: cfg.sbKey, Accept: 'application/json' };
+    // 新 publishable key 不是 JWT；只有旧 anon JWT 才可放在 Bearer 中。
+    if (cfg.sbKey && cfg.sbKey.indexOf('eyJ') === 0) head.Authorization = 'Bearer ' + cfg.sbKey;
+    if (cfg.accessToken) head['X-Space-Token'] = cfg.accessToken;
     if (extra) Object.keys(extra).forEach(function (k) { head[k] = extra[k]; });
     return head;
   }
 
-  function apiPull(force) {
-    if (activeMode() === 'supabase') return sbPull(force);
-    return fetchWithTimeout(apiPath() + '?since=' + (force ? 0 : SYNC.rev), {
+  function apiPull(force, settings, revision) {
+    var cfg = settings || SYNC.cfg;
+    var rev = revision === undefined ? SYNC.rev : revision;
+    if (activeMode(cfg) === 'supabase') return sbPull(force, cfg, rev);
+    return fetchWithTimeout(apiPath(cfg) + '?since=' + (force ? 0 : rev), {
       cache: 'no-store',
-      headers: syncHeaders()
+      headers: syncHeaders(null, cfg.token || SYNC.token)
     }).then(jsonOrThrow).then(function (res) {
       if (res.unchanged) return { unchanged: true, rev: res.rev };
       return { rev: res.rev || 0, data: res.data };
     });
   }
 
-  function apiPush() {
-    if (activeMode() === 'supabase') return sbPush();
-    return fetchWithTimeout(apiPath(), {
-      method: 'POST',
-      cache: 'no-store',
+  function apiPush(epoch) {
+    var cfg = Object.assign({}, SYNC.cfg);
+    if (activeMode(cfg) === 'supabase') return sbPush(cfg, epoch);
+    var snapshot = JSON.stringify(syncedPayload());
+    return fetchWithTimeout(apiPath(cfg), {
+      method: 'POST', cache: 'no-store',
       headers: syncHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ data: syncedPayload(), client: CLIENT_ID })
+      body: JSON.stringify({ data: JSON.parse(snapshot), client: CLIENT_ID })
     }).then(jsonOrThrow).then(function (res) {
-      return { rev: res.rev || 0, data: res.data };
+      return { rev: res.rev || 0, data: res.data, snapshot: snapshot };
     });
   }
 
-  function sbPull(force) {
-    var table = trimSlashes(SYNC.cfg.sbUrl) + '/rest/v1/little_days' +
-      '?id=eq.' + encodeURIComponent(sbSpaceId()) + '&select=rev,payload';
-    return fetchWithTimeout(table, { cache: 'no-store', headers: sbHeaders() })
-      .then(jsonOrThrow)
-      .then(function (rows) {
-        if (!rows || !rows.length) return { rev: 0, data: null };
+  function sbPull(force, settings, revision) {
+    var cfg = settings || SYNC.cfg;
+    var rev = revision === undefined ? SYNC.rev : revision;
+    var table = trimSlashes(cfg.sbUrl) + '/rest/v1/little_days' +
+      '?id=eq.' + encodeURIComponent(sbSpaceId(cfg)) + '&select=rev,payload';
+    return fetchWithTimeout(table, { cache: 'no-store', headers: sbHeaders(null, cfg) })
+      .then(jsonOrThrow).then(function (rows) {
+        if (!Array.isArray(rows) || rows.length > 1) throw new Error('INVALID_DATA');
+        if (!rows.length) return { rev: 0, data: null };
         var row = rows[0];
-        if (!force && row.rev && row.rev === SYNC.rev) return { unchanged: true, rev: row.rev };
-        return decryptJson(row.payload).then(function (data) {
-          return { rev: row.rev || 0, data: data };
+        if (!Number.isSafeInteger(row.rev) || row.rev < 0) throw new Error('INVALID_DATA');
+        if (!force && row.rev === rev) return { unchanged: true, rev: row.rev };
+        return decryptJson(row.payload, cfg).then(function (data) {
+          return { rev: row.rev, data: normalizeData(data) };
         });
       });
   }
 
-  function sbPush() {
-    return encryptJson(syncedPayload()).then(function (payload) {
-      var row = {
-        id: sbSpaceId(),
-        rev: (SYNC.rev || 0) + 1,
-        payload: payload,
-        updated_at: new Date().toISOString()
-      };
-      return fetchWithTimeout(trimSlashes(SYNC.cfg.sbUrl) + '/rest/v1/little_days', {
-        method: 'POST',
-        cache: 'no-store',
-        headers: sbHeaders({
-          'Content-Type': 'application/json',
-          'Prefer': 'resolution=merge-duplicates,return=representation'
-        }),
-        body: JSON.stringify([row])
+  function tokenHash(token) {
+    return window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(token)).then(toHex);
+  }
+
+  function sbPush(cfg, epoch) {
+    // 先合并另一台设备的新记录。PATCH 的版本条件使并发写入只能有一个成功。
+    return sbPull(true, cfg).then(function (latest) {
+      if (epoch !== SYNC.epoch) throw new Error('STALE_SYNC');
+      if (latest.data) applyRemote(latest.data);
+      var snapshot = JSON.stringify(syncedPayload());
+      return Promise.all([encryptJson(JSON.parse(snapshot), cfg),
+        cfg.accessToken ? tokenHash(cfg.accessToken) : Promise.resolve(null)]).then(function (values) {
+        if (epoch !== SYNC.epoch) throw new Error('STALE_SYNC');
+        var row = {
+          id: sbSpaceId(cfg), rev: latest.rev + 1, payload: values[0],
+          updated_at: new Date().toISOString()
+        };
+        if (values[1]) row.access_token_hash = values[1];
+        var url = trimSlashes(cfg.sbUrl) + '/rest/v1/little_days';
+        if (latest.data) url += '?id=eq.' + encodeURIComponent(row.id) + '&rev=eq.' + latest.rev;
+        return fetchWithTimeout(url, {
+          method: latest.data ? 'PATCH' : 'POST', cache: 'no-store',
+          headers: sbHeaders({ 'Content-Type': 'application/json', Prefer: 'return=representation' }, cfg),
+          body: JSON.stringify(row)
+        }).then(function (res) {
+          if (res.status === 409) {
+            // RLS 隐藏已有行时也会返回空列表；不能把错误访问密钥误认成新空间。
+            return sbPull(true, cfg).then(function (current) {
+              throw new Error(current.data ? 'SYNC_CONFLICT' : 'NEED_TOKEN');
+            });
+          }
+          return jsonOrThrow(res);
+        }).then(function (rows) {
+          if (!Array.isArray(rows) || rows.length !== 1 || rows[0].rev !== row.rev) throw new Error('SYNC_CONFLICT');
+          return { rev: row.rev, snapshot: snapshot };
+        });
       });
-    }).then(jsonOrThrow).then(function (rows) {
-      var saved = (rows && rows[0]) || {};
-      return { rev: saved.rev || ((SYNC.rev || 0) + 1) };
     });
   }
 
   // 参与同步的内容：记录 + 账号；不含「我是谁」「当前页面」这些每台设备自己的状态
-  function syncedPayload() {
-    return {
-      todos: state.todos,
-      ledger: state.ledger,
-      wishes: state.wishes,
-      saving: state.saving,
-      savingsLog: state.savingsLog,
-      moods: state.moods,
-      posts: state.posts,
-      comments: state.comments,
-      auth: { accounts: accounts() }
+  function syncedPayload(source) {
+    var data = source || state;
+    var payload = {
+      todos: data.todos,
+      ledger: data.ledger,
+      wishes: data.wishes,
+      saving: data.saving,
+      savingsLog: data.savingsLog,
+      moods: data.moods,
+      posts: data.posts,
+      comments: data.comments,
+      auth: { accounts: data.auth.accounts }
     };
+    // 顺序不代表变更，统一快照顺序，避免两台设备反复互相上传同一批记录。
+    LIST_KEYS.forEach(function (key) {
+      payload[key] = payload[key].slice().sort(function (a, b) { return String(a.id).localeCompare(String(b.id)); });
+    });
+    function canonical(value) {
+      if (Array.isArray(value)) return value.map(canonical);
+      if (!value || typeof value !== 'object') return value;
+      var out = Object.create(null);
+      Object.keys(value).sort().forEach(function (k) { out[k] = canonical(value[k]); });
+      return out;
+    }
+    return canonical(payload);
   }
 
   function mergeList(a, b) {
-    var byId = {};
+    var byId = Object.create(null);
     var order = [];
     [a || [], b || []].forEach(function (src) {
       src.forEach(function (rec) {
@@ -567,7 +646,9 @@
         if (!prev) {
           byId[rec.id] = rec;
           order.push(rec.id);
-        } else if ((rec.updatedAt || 0) > (prev.updatedAt || 0)) {
+        } else if ((rec.updatedAt || 0) > (prev.updatedAt || 0) ||
+          ((rec.updatedAt || 0) === (prev.updatedAt || 0) &&
+            (rec.deleted && !prev.deleted || !!rec.deleted === !!prev.deleted && JSON.stringify(rec) > JSON.stringify(prev)))) {
           byId[rec.id] = rec;
         }
       });
@@ -575,17 +656,25 @@
     return order.map(function (id) { return byId[id]; });
   }
 
-  // 按 id 求并集：两个人同时改也不会互相覆盖，只会合并
+  // 不同记录按 id 合并；同一记录采用 updatedAt 较新的版本。
   function mergeStates(local, remote) {
     if (!remote) return local;
+    remote = normalizeData(remote);
     var logs = mergeList(local.savingsLog, remote.savingsLog);
     var liveLogs = logs.filter(function (l) { return !l.deleted; });
     var localAuth = local.auth || {};
     var remoteAuth = remote.auth || {};
+    var mergedAccounts = mergeList(remoteAuth.accounts, localAuth.accounts);
+    if (mergedAccounts.length > 2) throw new Error('ACCOUNT_CONFLICT');
+    var localSaving = local.saving || {};
+    var remoteSaving = remote.saving || {};
+    var goalSource = (localSaving.updatedAt || 0) > (remoteSaving.updatedAt || 0)
+      ? localSaving : (localSaving.updatedAt || 0) < (remoteSaving.updatedAt || 0)
+        ? remoteSaving : ((localSaving.goal || 0) > (remoteSaving.goal || 0) ? localSaving : remoteSaving);
     var out = {
       view: local.view,
       auth: {
-        accounts: mergeList(localAuth.accounts, remoteAuth.accounts),
+        accounts: mergedAccounts,
         currentId: localAuth.currentId || null      // 登录身份只属于这台设备
       },
       todos: mergeList(local.todos, remote.todos),
@@ -596,10 +685,12 @@
       posts: mergeList(local.posts, remote.posts),
       comments: mergeList(local.comments, remote.comments),
       saving: {
-        goal: (remote.saving && remote.saving.goal) || (local.saving && local.saving.goal) || 20000,
+        goal: goalSource.goal || 20000,
+        updatedAt: goalSource.updatedAt || 0,
         saved: liveLogs.reduce(function (s, l) { return s + (l.amount || 0); }, 0)
       }
     };
+    recalculateSavings(out);
     return out;
   }
 
@@ -616,9 +707,9 @@
     }
   }
 
-  function syncHeaders(extra) {
-    var head = extra || {};
-    if (SYNC.token) head['X-Sync-Token'] = SYNC.token;
+  function syncHeaders(extra, token) {
+    var head = Object.assign({}, extra || {});
+    if (token || SYNC.token) head['X-Sync-Token'] = token || SYNC.token;
     return head;
   }
 
@@ -629,90 +720,88 @@
   }
 
   function syncInit() {
+    var epoch = ++SYNC.epoch;
+    if (SYNC.timer2) clearTimeout(SYNC.timer2);
     SYNC.cfg = loadSyncCfg();
     SYNC.token = SYNC.cfg.token || readToken();
-    sbKeyCache = null;
     SYNC.ready = false;
+    SYNC.verified = false;
     SYNC.rev = 0;
     SYNC.snapshot = null;
     SYNC.dirty = false;
     SYNC.busy = false;
+    SYNC.enabled = false;
     SYNC.autoOk = false;
     SYNC.lastError = '';
     SYNC.fails = 0;
     SYNC.nextTry = 0;
+    if (state.readError) { setSyncStatus('dataerror'); return; }
 
-    // 「跟随本页」模式：先探一下同源有没有 server.py。
-    // 放在 GitHub Pages 这类静态托管上时不应该被判成"离线"，而应该是"仅本机"。
-    if (SYNC.cfg.mode === 'auto' && (location.protocol === 'http:' || location.protocol === 'https:')) {
-      SYNC.enabled = false;
-      SYNC.status = 'local';
-      updateSyncChip();
+    if (SYNC.cfg.mode === 'auto' && /^https?:$/.test(location.protocol)) {
+      setSyncStatus('local');
+      // GitHub Pages 没有自建 API，不必每次发送一个必然 404 的请求。
+      if (/\.github\.io$/i.test(location.hostname)) return;
       fetchWithTimeout('api/ping', { cache: 'no-store' }, 5000)
         .then(function (r) { return r.ok ? r.json() : null; })
         .then(function (res) {
+          if (epoch !== SYNC.epoch) return;
           SYNC.autoOk = !!(res && res.ok);
           if (SYNC.autoOk) startSync();
-        })
-        .catch(function () { /* 没有同源服务，就保持"仅本机" */ });
+        }).catch(function () { /* 没有同源服务，保留本机模式 */ });
       return;
     }
     startSync();
   }
 
   function startSync() {
-    SYNC.busy = false;            // 别被上一次卡住的请求锁死
     SYNC.enabled = activeMode() !== 'off';
-    if (!SYNC.enabled) {
-      SYNC.status = 'local';
-      updateSyncChip();
-      return;
-    }
-    SYNC.status = 'syncing';
-    SYNC.ready = false;
-    updateSyncChip();
+    if (!SYNC.enabled) { setSyncStatus('local'); return; }
+    setSyncStatus('syncing');
     if (!SYNC.timer) {
       SYNC.timer = setInterval(tick, 5000);
       document.addEventListener('visibilitychange', function () {
         if (!document.hidden) tick();
       });
+      window.addEventListener('online', function () { SYNC.nextTry = 0; tick(); });
     }
     pull(true);
   }
 
+  function syncBlocked() {
+    return ['badkey', 'needtoken', 'dataerror', 'accountconflict'].indexOf(SYNC.status) >= 0;
+  }
+
   function tick() {
-    if (!SYNC.enabled || SYNC.busy || document.hidden) return;
-    // 失败后先别急着试，按退避等一会儿（避免一直闪着"同步中"）
-    if (SYNC.status === 'offline' && Date.now() < (SYNC.nextTry || 0)) return;
-    // 本地和「服务端已确认」的内容不一致，就先推上去，再拉
-    if (SYNC.snapshot === null || JSON.stringify(syncedPayload()) !== SYNC.snapshot) {
-      push();
-      return;
-    }
+    if (!SYNC.enabled || SYNC.busy || document.hidden || syncBlocked()) return;
+    if (Date.now() < SYNC.nextTry) return;
+    // 初次读取没有成功，绝不能直接拿本机内容覆盖云端。
+    if (!SYNC.verified) { pull(true); return; }
+    if (JSON.stringify(syncedPayload()) !== SYNC.snapshot) { push(); return; }
     pull(false);
   }
 
-  // 后台重试不要改状态标签：已经是"离线"就保持"离线"，成功了自然变"已同步"
   function beginSync() {
-    if (SYNC.status === 'offline' || SYNC.status === 'needtoken' || SYNC.status === 'badkey') return;
-    setSyncStatus('syncing');
+    if (SYNC.status !== 'offline') setSyncStatus('syncing');
   }
 
   function handleSyncError(err) {
     var code = String(err && err.message ? err.message : err);
     var friendly = code;
-    if (code === 'TIMEOUT') {
-      friendly = '请求超时（12 秒没有响应，网络可能被挡）';
-    } else if (/failed to fetch|networkerror|load failed|abort/i.test(code)) {
-      friendly = '连不上服务器（网络被拦或没有响应）';
-    } else if (/^HTTP 5\d\d$/.test(code)) {
-      friendly = '云端出错（' + code + '），稍后会自动重试';
-    }
+    if (code === 'TIMEOUT') friendly = '请求超时，请检查网络后重试';
+    else if (/failed to fetch|networkerror|load failed|abort/i.test(code)) friendly = '暂时连不上服务器';
+    else if (/^HTTP 5\d\d$/.test(code)) friendly = '云端出错（' + code + '），稍后自动重试';
+    else if (code === 'SYNC_CONFLICT') friendly = '另一台设备刚保存了内容，正在等待合并重试';
+    else if (code === 'ACCOUNT_CONFLICT') friendly = '本机和云端存在不同的账号。请先导出本机备份，再清空本机并重新连接已有空间';
+    else if (code === 'INVALID_DATA') friendly = '记录格式异常，已停止自动上传，请先导出备份';
+    else if (code === 'NEED_TOKEN') friendly = '请检查 API key、空间访问密钥及 Supabase 权限策略';
     SYNC.lastError = friendly;
-    SYNC.fails = (SYNC.fails || 0) + 1;
-    SYNC.nextTry = Date.now() + Math.min(60000, 5000 * Math.pow(2, SYNC.fails - 1));
+    SYNC.fails += 1;
+    SYNC.nextTry = Date.now() + Math.min(60000, 5000 * Math.pow(2, Math.min(SYNC.fails - 1, 4)));
     if (code === 'DECRYPT_FAILED' || code === 'DECRYPT_FORMAT') setSyncStatus('badkey');
-    else if (code !== 'NEED_TOKEN') setSyncStatus('offline');
+    else if (code === 'NEED_TOKEN') setSyncStatus('needtoken');
+    else if (code === 'INVALID_DATA') setSyncStatus('dataerror');
+    else if (code === 'ACCOUNT_CONFLICT') setSyncStatus('accountconflict');
+    else setSyncStatus('offline');
     updateSyncChip();
   }
 
@@ -720,64 +809,71 @@
     SYNC.fails = 0;
     SYNC.nextTry = 0;
     SYNC.lastError = '';
-    setSyncStatus('ok');
     SYNC.lastAt = Date.now();
+    SYNC.dirty = JSON.stringify(syncedPayload()) !== SYNC.snapshot;
+    setSyncStatus(SYNC.dirty ? 'syncing' : 'ok');
+    if (SYNC.dirty) {
+      if (SYNC.timer2) clearTimeout(SYNC.timer2);
+      SYNC.timer2 = setTimeout(tick, 500);
+    }
   }
 
   function pull(force) {
-    if (!SYNC.enabled || SYNC.busy) return;
+    if (!SYNC.enabled || SYNC.busy || syncBlocked()) return;
+    var epoch = SYNC.epoch;
     SYNC.busy = true;
-    apiPull(force)
-      .then(function (res) {
-        SYNC.busy = false;
-        var first = !SYNC.ready;
-        SYNC.ready = true;
-        if (res.unchanged) {
-          syncSucceeded();
-          if (first) render();
-          return;
-        }
+    return apiPull(force).then(function (res) {
+      if (epoch !== SYNC.epoch) return;
+      var first = !SYNC.ready;
+      if (!res.unchanged) {
         SYNC.rev = res.rev || 0;
         if (res.data) applyRemote(res.data);
-        syncSucceeded();
-        if (first) render();
-      })
-      .catch(function (err) {
-        SYNC.busy = false;
-        var firstFail = !SYNC.ready;
-        SYNC.ready = true;
-        handleSyncError(err);
-        if (firstFail) render();
-      });
+        SYNC.snapshot = res.data ? JSON.stringify(syncedPayload(normalizeData(res.data))) : '';
+      }
+      SYNC.verified = true;
+      SYNC.ready = true;
+      SYNC.busy = false;
+      syncSucceeded();
+      if (first) safeRender();
+    }).catch(function (err) {
+      if (epoch !== SYNC.epoch) return;
+      SYNC.busy = false;
+      var firstFail = !SYNC.ready;
+      SYNC.ready = true;
+      handleSyncError(err);
+      if (firstFail) safeRender();
+    });
   }
 
   function push() {
-    if (!SYNC.enabled) return;
+    if (!SYNC.enabled || syncBlocked()) return;
+    if (!SYNC.verified) return pull(true);
     if (SYNC.busy) { SYNC.dirty = true; return; }
+    var epoch = SYNC.epoch;
     SYNC.busy = true;
-    SYNC.dirty = false;
     beginSync();
-    apiPush()
-      .then(function (res) {
-        SYNC.busy = false;
-        SYNC.rev = res.rev || 0;
-        if (res.data) applyRemote(res.data);
-        SYNC.snapshot = JSON.stringify(syncedPayload());
-        syncSucceeded();
-      })
-      .catch(function (err) {
-        SYNC.busy = false;
-        SYNC.dirty = true;
-        handleSyncError(err);
-      });
+    return apiPush(epoch).then(function (res) {
+      if (epoch !== SYNC.epoch) return;
+      SYNC.rev = res.rev || 0;
+      if (res.data) applyRemote(res.data);
+      // 必须记住实际发出的快照，不能把请求期间的新编辑也算成已上传。
+      SYNC.snapshot = res.snapshot;
+      SYNC.busy = false;
+      syncSucceeded();
+    }).catch(function (err) {
+      if (epoch !== SYNC.epoch) return;
+      SYNC.busy = false;
+      SYNC.dirty = true;
+      handleSyncError(err);
+    });
   }
 
   function markDirty() {
-    if (!SYNC.enabled) return;
-    if (SYNC.snapshot !== null && JSON.stringify(syncedPayload()) === SYNC.snapshot) return;
+    if (!SYNC.enabled || syncBlocked()) return;
+    if (JSON.stringify(syncedPayload()) === SYNC.snapshot) return;
     SYNC.dirty = true;
     if (SYNC.timer2) clearTimeout(SYNC.timer2);
-    SYNC.timer2 = setTimeout(push, 500);
+    SYNC.timer2 = setTimeout(tick, 500);
   }
 
   function applyRemote(remote) {
@@ -796,11 +892,21 @@
   function safeRender() {
     var ae = document.activeElement;
     var view = document.getElementById('view');
-    if (ae && view && /^(INPUT|TEXTAREA)$/.test(ae.tagName) && view.contains(ae)) {
+    if (document.querySelector('.modal') || ae && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName)) {
       pendingRender = true;
       return;
     }
+    var drafts = [];
+    if (view) view.querySelectorAll('input:not([type="file"]), textarea, select').forEach(function (el) {
+      drafts.push({ id: el.id, post: el.dataset.post, enter: el.dataset.enter, value: el.value });
+    });
+    pendingRender = false;
     render();
+    drafts.forEach(function (d) {
+      var el = d.id ? document.getElementById(d.id) : document.querySelector('[data-post="' + d.post + '"][data-enter="' + d.enter + '"]');
+      if (el) el.value = d.value;
+    });
+    renderPendingImages();
   }
 
   function syncChip() {
@@ -810,15 +916,19 @@
       ok: '已同步',
       offline: '离线 · 待同步',
       needtoken: '需要口令',
-      badkey: '口令不对'
+      badkey: '口令不对',
+      dataerror: '数据需检查',
+      accountconflict: '账号冲突'
     };
     var tips = {
       local: '数据只存在这台设备上。想让手机也能一起编辑，点「同步设置」接上云。',
       syncing: '正在和同步服务交换数据…',
-      ok: '两台设备看到的是一样的。',
+      ok: '本机改动已确认保存到云端，另一台设备联网后会自动获取。',
       offline: '连不上同步服务，改动先存在本机，恢复后会自动补上。',
       needtoken: '服务端要求访问口令，请到「同步设置」里填写。',
-      badkey: '同步口令不对，解不开云端数据（没有覆盖云端）。'
+      badkey: '同步口令不对，解不开云端数据（没有覆盖云端）。',
+      dataerror: '数据格式异常，已停止上传。请先导出备份。',
+      accountconflict: '本机和云端账号不同，已停止上传。请先导出备份。'
     };
     var s = SYNC.status;
     return '<span class="sync-chip ' + s + '" title="' + (tips[s] || '') + '">' +
@@ -829,10 +939,12 @@
     var hints = {
       local: '现在数据只保存在这台设备上。点「同步设置」接上云，两台手机就能看到同一份记录。',
       syncing: '正在同步…',
-      ok: '两台设备看到的是一样的，改动会在几秒内互相出现。',
+      ok: '本机改动已保存到云端，另一台设备联网后会自动获取。',
       offline: '暂时连不上云端' + (SYNC.lastError ? '（' + SYNC.lastError + '）' : '') + '，改动已经存在本机，恢复后会自动补上去。',
       needtoken: '服务端要求访问口令：到「同步设置」里填上。',
-      badkey: '同步口令不对，云端的数据解不开。为了避免覆盖，已经停止上传。'
+      badkey: '同步口令不对，云端的数据解不开，已经停止上传。',
+      dataerror: SYNC.lastError || '数据格式异常，已停止同步，请先备份。',
+      accountconflict: SYNC.lastError || '账号冲突，请先导出本机备份。'
     };
     return hints[SYNC.status] || hints.local;
   }
@@ -846,9 +958,12 @@
     }
     var hint = document.getElementById('sync-hint');
     if (hint) hint.textContent = syncHint();
+    var summary = document.getElementById('overview-sync-hint');
+    if (summary) summary.textContent = SYNC.enabled ? syncHint() : '从今天起，把值得记住的小事写在这里。';
   }
 
-  function importRecords() {    var picker = document.createElement('input');
+  function importRecords() {
+    var picker = document.createElement('input');
     picker.type = 'file';
     picker.accept = 'application/json,.json';
     picker.addEventListener('change', function () {
@@ -857,7 +972,9 @@
       var reader = new FileReader();
       reader.onload = function () {
         try {
-          var data = JSON.parse(String(reader.result));
+          var raw = JSON.parse(String(reader.result));
+          if (!LIST_KEYS.some(function (k) { return Object.prototype.hasOwnProperty.call(raw, k); })) throw new Error('INVALID_DATA');
+          var data = normalizeData(raw);
           var before = JSON.stringify(syncedPayload());
           state = mergeStates(state, data);
           saveState();
@@ -866,7 +983,7 @@
             ? '这个文件和现在的记录是一样的。'
             : '已经并进来了，重复的不会重复算。');
         } catch (err) {
-          toast('这个文件读不出来，确认是导出的 JSON 吗？');
+          toast(err.message === 'ACCOUNT_CONFLICT' ? '备份属于另一套账号，未导入。请使用同一空间的备份。' : '文件格式不正确，原来的记录没有改动。');
         }
       };
       reader.readAsText(file);
@@ -878,32 +995,12 @@
 
   var syncDraft = null;
 
-  var SUPABASE_SQL =
-    'create table if not exists public.little_days (\n' +
-    '  id text primary key,\n' +
-    '  rev bigint not null default 0,\n' +
-    '  payload text not null,\n' +
-    '  updated_at timestamptz not null default now()\n' +
-    ');\n\n' +
-    'alter table public.little_days enable row level security;\n\n' +
-    'create policy "little_days read"   on public.little_days for select to anon using (true);\n' +
-    'create policy "little_days write"  on public.little_days for insert to anon with check (true);\n' +
-    'create policy "little_days update" on public.little_days for update to anon using (true) with check (true);';
+  var SUPABASE_SQL = "-- 两人小日子：新项目建表 / 可选的空间权限升级（整段执行）\n-- 已有空间：先导出 JSON；备份 Project URL、原同步口令。\n-- 两台设备更新网页，并配置相同的随机访问密钥（至少 24 位）。\n-- 本表应专用于本站；脚本会替换该表的全部 RLS 策略。\nbegin;\n\ncreate table if not exists public.little_days (\n  id text primary key,\n  rev bigint not null default 0,\n  payload text not null,\n  updated_at timestamptz not null default now(),\n  access_token_hash text\n);\nalter table public.little_days add column if not exists access_token_hash text;\n\n-- 已有空间必须取消下面两行的注释，替换密钥和空间 ID 后一起执行。\n-- update public.little_days set access_token_hash =\n--   encode(sha256(convert_to('替换成你生成的空间访问密钥', 'UTF8')), 'hex') where id = '替换成同步设置中显示的空间ID';\n\n-- 防止直接运行后把已有空间锁住；出错会回滚整段脚本。\ndo $$\nbegin\n  if exists (select 1 from public.little_days where access_token_hash is null) then\n    raise exception '已有空间尚未设置访问密钥：请先填写上面的 UPDATE，并为表中每个空间设置密钥。';\n  end if;\nend $$;\n\nalter table public.little_days enable row level security;\ndo $$\ndeclare p record;\nbegin\n  for p in select policyname from pg_policies\n    where schemaname = 'public' and tablename = 'little_days'\n  loop\n    execute format('drop policy %I on public.little_days', p.policyname);\n  end loop;\nend $$;\n\ncreate policy \"little_days scoped access\" on public.little_days\nfor all to anon\nusing (\n  length(coalesce(current_setting('request.headers', true)::json->>'x-space-token', '')) >= 24\n  and access_token_hash = encode(sha256(convert_to(\n    coalesce(current_setting('request.headers', true)::json->>'x-space-token', ''), 'UTF8')), 'hex')\n)\nwith check (\n  length(coalesce(current_setting('request.headers', true)::json->>'x-space-token', '')) >= 24\n  and access_token_hash = encode(sha256(convert_to(\n    coalesce(current_setting('request.headers', true)::json->>'x-space-token', ''), 'UTF8')), 'hex')\n);\nrevoke all on public.little_days from anon;\ngrant select, insert, update on public.little_days to anon;\ncommit;\n";
 
-  var MEDIA_SQL =
-    'insert into storage.buckets (id, name, public)\n' +
-    "values ('media', 'media', true)\n" +
-    'on conflict (id) do update set public = true;\n\n' +
-    'drop policy if exists "media upload" on storage.objects;\n' +
-    'create policy "media upload" on storage.objects\n' +
-    "  for insert to anon with check (bucket_id = 'media');\n\n" +
-    'drop policy if exists "media read" on storage.objects;\n' +
-    'create policy "media read" on storage.objects\n' +
-    "  for select to anon using (bucket_id = 'media');";
+  var MEDIA_SQL = "-- 可选：先完成 supabase-security.sql，再配置图片桶。\n-- 图片通过公开 URL 展示，没有加密；本脚本仅收紧上传与对象列表权限。\nbegin;\ninsert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)\nvalues ('media', 'media', true, 2097152, array['image/jpeg'])\non conflict (id) do update set public = true, file_size_limit = 2097152,\n  allowed_mime_types = array['image/jpeg'];\n\ndrop policy if exists \"media upload\" on storage.objects;\ndrop policy if exists \"media read\" on storage.objects;\ncreate policy \"media upload\" on storage.objects\nfor insert to anon with check (\n  bucket_id = 'media'\n  and exists (\n    select 1 from public.little_days as room\n    where room.id = (storage.foldername(name))[1]\n      and room.access_token_hash = encode(sha256(convert_to(\n        coalesce(current_setting('request.headers', true)::json->>'x-space-token', ''), 'UTF8')), 'hex')\n  )\n);\ncreate policy \"media read\" on storage.objects\nfor select to anon using (\n  bucket_id = 'media'\n  and exists (\n    select 1 from public.little_days as room\n    where room.id = (storage.foldername(name))[1]\n      and room.access_token_hash = encode(sha256(convert_to(\n        coalesce(current_setting('request.headers', true)::json->>'x-space-token', ''), 'UTF8')), 'hex')\n  )\n);\ncommit;\n";
 
   function openSyncModal() {
-    captureSyncForm();
-    if (!syncDraft) syncDraft = JSON.parse(JSON.stringify(SYNC.cfg || loadSyncCfg()));
+    syncDraft = Object.assign({}, SYNC.cfg || loadSyncCfg());
     renderSyncModal();
   }
 
@@ -931,30 +1028,33 @@
       return '<div class="field"><label for="sync-sburl">Project URL</label>' +
           '<input class="input" id="sync-sburl" data-cfg="sbUrl" value="' + esc(syncDraft.sbUrl) +
           '" placeholder="https://xxxxxxxx.supabase.co" /></div>' +
-        '<div class="field"><label for="sync-sbkey">anon public key</label>' +
+        '<div class="field"><label for="sync-sbkey">publishable key 或 anon public key</label>' +
           '<input class="input" id="sync-sbkey" data-cfg="sbKey" value="' + esc(syncDraft.sbKey) +
           '" placeholder="eyJhbGciOiJIUzI1NiIs..." /></div>' +
         '<div class="field" style="margin-bottom:0"><label for="sync-pass">同步口令（两台设备必须一样）</label>' +
           '<input class="input" id="sync-pass" type="password" data-cfg="pass" value="' + esc(syncDraft.pass) +
-          '" placeholder="至少 6 位；忘了就解不开云端数据" /></div>' +
+          '" placeholder="建议 16 位以上；已有空间请保持原口令" /></div>' +
+        '<div class="field"><label for="sync-access">空间访问密钥（启用权限升级后必填）</label>' +
+          '<input class="input" id="sync-access" type="password" autocomplete="off" data-cfg="accessToken" value="' + esc(syncDraft.accessToken || '') + '" placeholder="两台设备一致，至少 24 位；旧项目可留空" />' +
+          '<button class="auth-link" data-action="generate-access-token">生成随机访问密钥</button></div>' +
+        '<p class="dim">当前空间 ID：<code>' + esc(sbSpaceId(syncDraft)) + '</code>（权限迁移时使用）</p>' +
         '<div class="sync-note">' +
           '<details class="sync-help">' +
             '<summary>怎么搭？点开看步骤和要复制的 SQL</summary>' +
             '<div class="sync-help-body">' +
-              '<p><b>三步：</b>登录 supabase.com 建一个免费项目 → 左侧 SQL Editor 里粘贴下面这段并 Run → ' +
-              '再到 Project Settings → API 复制 Project URL 和 anon public key 填到上面。</p>' +
+              '<p>新项目：先填 URL、公开 API key、同步口令和随机访问密钥，再运行下面的 SQL。已有项目请先导出备份，按 SQL 注释填写 UPDATE，为原空间设置访问密钥后再运行。两台设备都要更新配置。</p>' +
               '<pre class="sql" id="sync-sql">' + esc(SUPABASE_SQL) + '</pre>' +
               '<button class="btn btn-ghost btn-copy" data-action="copy-sql">' + icon('check', 14) + '复制这段 SQL</button>' +
             '</div>' +
           '</details>' +
-          '<p class="dim">上传前会用同步口令在本机加密（AES-GCM），云端只能看到乱码。</p>' +
+          '<p class="dim">文字记录上传前会加密。新项目请填写空间访问密钥；已有项目先按更新说明迁移权限。修改同步口令会切换到另一个空间，不是修改登录密码。</p>' +
         '</div>' +
         '<div class="sync-note">' +
           '<details class="sync-help">' +
             '<summary>想让「说说」能发图片？点开跑这段 SQL</summary>' +
             '<div class="sync-help-body">' +
-              '<p><b>作用：</b>建一个公开的 <b>media</b> 桶，并允许当前 key 往里面传文件。' +
-              '图片压缩后传到 Supabase Storage，帖子里只存链接——所以同步数据不会被图片撑大。</p>' +
+              '<p><b>先完成上面的空间权限配置并保存一次记录，再运行这段。</b>建立公开的 <b>media</b> 桶，上传需要空间访问密钥。' +
+              '图片压缩后传到 Supabase Storage，帖子里只存链接。图片没有加密，知道图片链接的人可以查看，请自行决定是否使用公开图片桶。</p>' +
               '<pre class="sql" id="media-sql">' + esc(MEDIA_SQL) + '</pre>' +
               '<button class="btn btn-ghost btn-copy" data-action="copy-media-sql">' + icon('check', 14) + '复制图片用 SQL</button>' +
             '</div>' +
@@ -1012,22 +1112,18 @@
       say('这个浏览器不支持加密（需要安全上下文），换 Chrome / Edge / Safari 试试。');
       return;
     }
-    var backup = SYNC.cfg;
-    SYNC.cfg = syncDraft;
-    if (activeMode() === 'off') {
-      SYNC.cfg = backup;
+    var cfg = Object.assign({}, syncDraft);
+    if (activeMode(cfg) === 'off') {
       say(syncDraft.mode === 'off' ? '当前选择的是「不用同步」。' : '信息还不完整，把地址 / key / 口令填全。');
       return;
     }
     say('正在连接…');
-    apiPull(true)
+    apiPull(true, cfg, 0)
       .then(function (res) {
-        SYNC.cfg = backup;
-        if (!res.data) say('连上了 ✓ 但云端还没有数据——两台设备第一次用属于正常，保存后会创建。');
+        if (!res.data) say('连接成功，当前凭据下未读到数据。若空间已经存在，请核对访问密钥和权限；新空间保存后才会创建。');
         else say('连上了 ✓ 云端已有数据（rev ' + res.rev + '），说明口令和地址都对。');
       })
       .catch(function (err) {
-        SYNC.cfg = backup;
         var code = String(err && err.message);
         if (code === 'DECRYPT_FAILED' || code === 'DECRYPT_FORMAT') {
           say('连上了，但同步口令不对，解不开云端的数据。');
@@ -1045,6 +1141,18 @@
       if (!syncDraft.sbUrl || !syncDraft.sbKey) { toast('Supabase 的 URL 和 key 都要填。'); return; }
       if ((syncDraft.pass || '').length < 6) { toast('同步口令至少 6 位。'); return; }
       if (!sbReady()) { toast('这个浏览器不支持加密，换 Chrome / Edge / Safari。'); return; }
+      try {
+        var url = new URL(syncDraft.sbUrl);
+        if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || url.pathname !== '/') throw new Error('URL');
+        syncDraft.sbUrl = url.origin;
+      } catch (err) { toast('Project URL 请填写 https:// 开头的项目根地址。'); return; }
+      if (/^sb_secret_/.test(syncDraft.sbKey)) { toast('不能在网页中使用 secret key，请换 publishable 或 anon key。'); return; }
+      try {
+        if (syncDraft.sbKey.indexOf('eyJ') === 0 && JSON.parse(b64urlDecode(syncDraft.sbKey.split('.')[1])).role === 'service_role') {
+          toast('不能在网页中使用 service_role key，请换 anon key。'); return;
+        }
+      } catch (err) { toast('API key 格式不正确，请重新复制。'); return; }
+      if (syncDraft.accessToken && syncDraft.accessToken.length < 24) { toast('空间访问密钥至少 24 位。'); return; }
     }
     if (syncDraft.mode === 'server' && syncDraft.url && !/^https?:\/\//.test(syncDraft.url)) {
       toast('服务地址要以 http:// 或 https:// 开头。');
@@ -1100,6 +1208,7 @@
     if (cfg.sbUrl) out.s = cfg.sbUrl;
     if (cfg.sbKey) out.k = cfg.sbKey;
     if (cfg.pass) out.p = cfg.pass;
+    if (cfg.accessToken) out.a = cfg.accessToken;
     return out;
   }
 
@@ -1151,6 +1260,10 @@
     cfg.sbUrl = data.s || '';
     cfg.sbKey = data.k || '';
     cfg.pass = data.p || '';
+    cfg.accessToken = data.a || '';
+    if ([cfg.url, cfg.token, cfg.sbUrl, cfg.sbKey, cfg.pass, cfg.accessToken].some(function (s) { return typeof s !== 'string'; })) {
+      toast('配置链接格式不正确。'); return false;
+    }
     saveSyncCfg(cfg);
     SYNC.cfg = cfg;
     toast('同步配置已就绪，正在连接…');
@@ -1216,7 +1329,7 @@
       return hashPassword(n1, salt).then(function (nextHash) {
         me.salt = salt;
         me.hash = nextHash;
-        me.updatedAt = Date.now();
+        me.updatedAt = editTime(me);
         saveState();
         closeModal();
         render();
@@ -1237,7 +1350,7 @@
     var rec = (state[kind] || []).filter(function (r) { return r.id === id; })[0];
     if (!rec) return false;
     rec.deleted = true;
-    rec.updatedAt = Date.now();
+    rec.updatedAt = editTime(rec);
     return true;
   }
 
@@ -1250,7 +1363,7 @@
   }
 
   function sum(list) {
-    return list.reduce(function (s, e) { return s + e.amount; }, 0);
+    return Math.round(list.reduce(function (s, e) { return s + e.amount; }, 0) * 100) / 100;
   }
 
   function todaySpend() {
@@ -1287,12 +1400,15 @@
   }
 
   function savedTotal() {
-    return alive(state.savingsLog).reduce(function (s, l) { return s + (l.amount || 0); }, 0);
+    return sum(alive(state.savingsLog));
   }
 
   function moodOf(who, day) {
     var list = alive(state.moods).filter(function (m) { return m.who === who && recordOffset(m) === day; });
-    return list.length ? list[list.length - 1] : null;
+    list.sort(function (a, b) {
+      return (b.updatedAt || 0) - (a.updatedAt || 0) || String(b.time || '').localeCompare(String(a.time || '')) || String(b.id).localeCompare(String(a.id));
+    });
+    return list.length ? list[0] : null;
   }
 
   function postComments(postId) {
@@ -1388,7 +1504,7 @@
       '</div>' +
 
       '<button class="account" data-action="account" aria-haspopup="dialog">' +
-        '<span class="avatar">' + me.emoji + '</span>' +
+        '<span class="avatar">' + esc(me.emoji) + '</span>' +
         '<span class="account-text">' +
           '<span class="account-role">' + role + '</span>' +
           '<span class="account-name">' + esc(me.name) + '</span>' +
@@ -1410,7 +1526,7 @@
       '</div>' +
       '<div class="top-actions">' +
         syncChip() +
-        '<span class="hint"><i class="hint-dot"></i><span>灵感示例</span></span>' +
+        '<span class="hint"><i class="hint-dot"></i><span>我们的记录</span></span>' +
         '<button class="icon-btn" data-action="share" aria-label="分享我们的空间">' + icon('share', 18) + '</button>' +
         '<button class="btn btn-primary btn-split" data-action="quick" data-kind="menu">' +
           icon('plus', 17) + '<span class="btn-label">记录一下</span>' +
@@ -1435,7 +1551,7 @@
   function noticeBar() {
     return '<section class="notice reveal" style="--d:40ms">' +
       '<p class="notice-text">' + icon('sparkles', 16) +
-        '<span>先逛逛我们的理想日常 · 这里展示的是可体验的示例数据</span></p>' +
+        '<span id="overview-sync-hint">' + esc(SYNC.enabled ? syncHint() : '从今天起，把值得记住的小事写在这里。') + '</span></p>' +
       '<button class="link flat" data-action="nav" data-view="todos">开始我们的记录' +
         icon('arrowRight', 15) + '</button>' +
       '</section>';
@@ -1472,8 +1588,8 @@
       '<div class="hero-art">' +
         '<div class="orbit"></div>' +
         '<div class="blobs">' +
-          '<div class="blob blob-a"><span>' + CONFIG.couple.a.emoji + '</span></div>' +
-          '<div class="blob blob-b"><span>' + CONFIG.couple.b.emoji + '</span></div>' +
+          '<div class="blob blob-a"><span>' + esc(person('a').emoji) + '</span></div>' +
+          '<div class="blob blob-b"><span>' + esc(person('b').emoji) + '</span></div>' +
           '<span class="knot">' + icon('heart', 13) + '</span>' +
         '</div>' +
         sparks() +
@@ -1535,7 +1651,7 @@
         ' aria-label="' + esc(t.text) + '">' + icon('check', 13) + '</button>' +
       '<div class="todo-main">' +
         '<p class="todo-text">' + esc(t.text) + '</p>' +
-        '<p class="todo-when">' + esc(t.when) + '</p>' +
+        '<p class="todo-when">' + esc(t.dueDate ? t.dueDate + ' · ' + todoGroup(t) : t.when) + '</p>' +
       '</div>' +
       '<span class="tag">' + esc(t.tag) + '</span>' +
       delButton('todos', t.id, t.text) +
@@ -1544,20 +1660,20 @@
 
   function moodCard(who, mood) {
     var p = person(who);
-    var line = mood ? mood.mood + ' ' + esc(mood.note) : '还没有记录今天的心情';
+    var line = mood ? esc(mood.mood) + ' ' + esc(mood.note) : '还没有记录今天的心情';
     return '<article class="mood-card ' + who + '" data-action="nav" data-view="moods" tabindex="0" role="button">' +
       '<div class="row1">' +
-        '<span class="mood-ava">' + p.emoji + '</span>' +
-        '<span class="mood-name">' + p.name + '</span>' +
+        '<span class="mood-ava">' + esc(p.emoji) + '</span>' +
+        '<span class="mood-name">' + esc(p.name) + '</span>' +
         (mood ? '<i class="dot"></i>' : '') +
       '</div>' +
       '<p class="mood-quote">' + line + '</p>' +
-      '<p class="mood-time">' + (mood ? '今天 ' + mood.time : '等一句话就好') + '</p>' +
+      '<p class="mood-time">' + (mood ? '今天 ' + esc(mood.time) : '等一句话就好') + '</p>' +
       '</article>';
   }
 
   function todoPanel() {
-    var list = alive(state.todos).slice(0, 3);
+    var list = alive(state.todos).filter(function (t) { return !t.done && (todoGroup(t) === '今天' || todoGroup(t) === '逾期'); }).slice(0, 3);
     return '<section class="card panel reveal" style="--d:340ms">' +
       '<div class="card-head">' +
         '<div><h3 class="card-title">今天的小事</h3>' +
@@ -1585,6 +1701,13 @@
 
   /* --------------------------------------------------------------- 视图 */
 
+  function todoGroup(t) {
+    if (t.done) return '已完成';
+    if (!validDay(t.dueDate)) return '本周';
+    var offset = recordOffset({ date: t.dueDate });
+    return offset < 0 ? '逾期' : offset === 0 ? '今天' : offset === 1 ? '明天' : '以后';
+  }
+
   var VIEWS = {
 
     overview: {
@@ -1606,7 +1729,7 @@
       emoji: '✅',
       lede: '不着急，我们有的是时间。',
       render: function () {
-        var groups = ['今天', '明天', '本周'];
+        var groups = ['逾期', '今天', '明天', '以后', '本周', '已完成'];
         var all = alive(state.todos);
         var done = all.filter(function (t) { return t.done; }).length;
         var pct = all.length ? Math.round((done / all.length) * 100) : 0;
@@ -1621,11 +1744,12 @@
             '<div class="bar"><i class="bar-fill" style="width:' + pct + '%"></i></div>' +
             '<div class="inline-form">' +
               '<input class="input" id="new-todo" data-enter="add-todo" placeholder="想一起做点什么？" aria-label="新的待办" />' +
+              '<input class="input date-input" id="new-todo-date" type="date" value="' + isoDay(today()) + '" aria-label="待办日期" />' +
               '<button class="btn btn-primary" data-action="add-todo">' + icon('plus', 16) + '加一件</button>' +
             '</div>' +
           '</section>' +
           groups.map(function (g, i) {
-            var rows = all.filter(function (t) { return t.when === g; });
+            var rows = all.filter(function (t) { return todoGroup(t) === g; });
             if (!rows.length) return '';
             return '<section class="card panel reveal" style="--d:' + (80 + i * 40) + 'ms">' +
               '<div class="card-head"><div><h3 class="card-title">' + g + '</h3>' +
@@ -1668,6 +1792,7 @@
               '</select>' +
               '<input class="input" id="new-ledger" data-enter="add-ledger" placeholder="这笔钱花在哪了？" aria-label="账目名称" />' +
               '<input class="input num-input" id="new-ledger-amount" data-enter="add-ledger" type="number" min="0" step="0.01" placeholder="金额" aria-label="金额" />' +
+              '<input class="input date-input" id="new-ledger-date" type="date" value="' + isoDay(today()) + '" max="' + isoDay(today()) + '" aria-label="记账日期" />' +
               '<button class="btn btn-primary" data-action="add-ledger">' + icon('plus', 16) + '记一笔</button>' +
             '</div>' +
           '</section>' +
@@ -1754,7 +1879,7 @@
             (logs.length ? '<ul>' + logs.map(function (l) {
               var w = l.wishId ? findRecord('wishes', l.wishId) : null;
               return '<li class="ledger-row">' +
-                '<span class="cat">' + (w ? w.emoji : '🪙') + '</span>' +
+                '<span class="cat">' + (w ? esc(w.emoji) : '🪙') + '</span>' +
                 '<div class="todo-main"><p class="todo-text">' + esc(l.who) + ' 存了一笔' +
                   (w ? ' · ' + esc(w.title) : '') + '</p>' +
                 '<p class="todo-when">' + dayLabel(recordOffset(l)) + '</p></div>' +
@@ -1777,9 +1902,9 @@
           var p = person(who);
           var cur = moodOf(who, 0);
           return '<section class="card panel reveal" style="--d:' + (who === 'a' ? 40 : 80) + 'ms">' +
-            '<div class="card-head"><div><h3 class="card-title">' + p.name + ' 今天的心情</h3>' +
-            '<p class="card-sub">' + (cur ? cur.mood + ' ' + esc(cur.note) : '选一个最接近的表情吧') + '</p></div>' +
-            (cur ? '<span class="tag">' + cur.time + '</span>' : '') + '</div>' +
+            '<div class="card-head"><div><h3 class="card-title">' + esc(p.name) + ' 今天的心情</h3>' +
+            '<p class="card-sub">' + (cur ? esc(cur.mood) + ' ' + esc(cur.note) : '选一个最接近的表情吧') + '</p></div>' +
+            (cur ? '<span class="tag">' + esc(cur.time) + '</span>' : '') + '</div>' +
             '<div class="mood-picker">' + MOODS.map(function (m) {
               return '<button class="mood-btn' + (cur && cur.mood === m.emoji ? ' on' : '') + '"' +
                 ' data-action="set-mood" data-who="' + who + '" data-mood="' + m.emoji + '">' +
@@ -1795,9 +1920,9 @@
               '<p class="card-sub">一共 ' + history.length + ' 条，都是真实的我们</p></div></div>' +
             (history.length ? '<ul>' + history.map(function (m) {
               return '<li class="history-row">' +
-                '<span class="history-emoji">' + m.mood + '</span>' +
+                '<span class="history-emoji">' + esc(m.mood) + '</span>' +
                 '<div class="todo-main"><p class="history-note">' + esc(m.note) + '</p>' +
-                '<p class="history-time">' + person(m.who).name + ' · ' + dayLabel(recordOffset(m)) + ' ' + m.time + '</p></div>' +
+                '<p class="history-time">' + esc(person(m.who).name) + ' · ' + dayLabel(recordOffset(m)) + ' ' + esc(m.time) + '</p></div>' +
                 delButton('moods', m.id, m.note) +
                 '</li>';
             }).join('') + '</ul>' : '<p class="empty">还没有心情记录。</p>') +
@@ -1822,7 +1947,7 @@
         return pageHead(VIEWS.posts) +
           '<section class="card panel reveal" style="--d:40ms">' +
             '<div class="composer">' +
-              '<span class="avatar">' + me.emoji + '</span>' +
+              '<span class="avatar">' + esc(me.emoji) + '</span>' +
               '<input class="input" id="new-post" data-enter="add-post" maxlength="300"' +
                 ' placeholder="此刻想和你说点什么？" aria-label="新的说说" />' +
               '<button class="btn btn-ghost btn-sm" data-action="pick-image" title="添加图片">' +
@@ -1844,7 +1969,7 @@
     var comments = postComments(p.id);
     return '<article class="card post reveal">' +
       '<div class="post-head">' +
-        '<span class="post-ava">' + who.emoji + '</span>' +
+        '<span class="post-ava">' + esc(who.emoji) + '</span>' +
         '<div class="post-meta">' +
           '<p class="post-name">' + esc(who.name) + '</p>' +
           '<p class="post-time">' + dayLabel(recordOffset(p)) + ' ' + esc(p.time || '') + '</p>' +
@@ -1853,7 +1978,7 @@
       '</div>' +
       (p.text ? '<p class="post-text">' + esc(p.text) + '</p>' : '') +
       (p.images && p.images.length
-        ? '<div class="post-imgs">' + p.images.map(function (u) {
+        ? '<div class="post-imgs">' + p.images.filter(safeImageUrl).map(function (u) {
             return '<a href="' + esc(u) + '" target="_blank" rel="noopener">' +
               '<img class="post-img" src="' + esc(u) + '" loading="lazy" alt="图片" /></a>';
           }).join('') + '</div>'
@@ -1878,7 +2003,7 @@
   function ledgerRow(e) {
     var income = e.amount > 0;
     return '<li class="ledger-row">' +
-      '<span class="cat">' + e.cat + '</span>' +
+      '<span class="cat">' + esc(e.cat) + '</span>' +
       '<div class="todo-main">' +
         '<p class="todo-text">' + esc(e.title) + '</p>' +
         '<p class="todo-when">' + dayLabel(recordOffset(e)) + ' · ' + esc(e.who) + '</p>' +
@@ -1894,7 +2019,7 @@
     var done = w.status === '已完成';
     return '<article class="card wish reveal" style="--d:' + (delay || 80) + 'ms">' +
       '<div class="wish-top">' +
-        '<span class="wish-emoji">' + w.emoji + '</span>' +
+        '<span class="wish-emoji">' + esc(w.emoji) + '</span>' +
         '<span class="wish-title">' + esc(w.title) + '</span>' +
         '<span class="tag' + (done ? '' : (w.status === '等你一起商量' ? ' warm' : '')) + '" ' +
           'style="margin-left:auto">' + esc(w.status) + '</span>' +
@@ -1995,12 +2120,14 @@
       authWarn() +
       '<h1 class="auth-title">先建一个只属于你们的空间</h1>' +
       '<p class="auth-sub">两个人各有一个账号，这样账本和心情才知道是谁记下的。' +
-      '密码只保存在这台设备上，不会上传到任何服务器。</p>' +
+      '密码以加盐摘要保存，启用同步后摘要会随加密记录同步。登录用于区分记录身份。</p>' +
       '<div class="auth-slots">' + slots + '</div>' +
       '<p class="auth-error" id="auth-error"></p>' +
       '<div class="auth-foot">' +
         '<span class="auth-links">' +
           '<button class="auth-link" data-action="sync-settings">同步设置</button>' +
+          '<button class="auth-link" data-action="import">恢复备份</button>' +
+          '<button class="auth-link" data-action="export">导出备份</button>' +
           '<button class="auth-link" data-action="reset-space">清空本机数据</button>' +
         '</span>' +
         '<button class="btn btn-primary" data-action="auth-submit">' + icon('check', 16) + '创建并进入</button>' +
@@ -2013,11 +2140,13 @@
     var cfg = SYNC.cfg || loadSyncCfg();
     var configured = !!(cfg.sbUrl || cfg.url);
 
-    if (SYNC.status === 'offline' || SYNC.status === 'needtoken' || SYNC.status === 'badkey') {
+    if (SYNC.status === 'offline' || syncBlocked()) {
       var why = {
         offline: '连不上你们的云端',
         needtoken: '云端需要访问口令',
-        badkey: '同步口令不对，解不开云端数据'
+        badkey: '同步口令不对，解不开云端数据',
+        dataerror: '记录格式需要检查',
+        accountconflict: '本机与云端账号冲突'
       }[SYNC.status];
       return '<div class="auth-warn is-bad">' +
         '<b>' + why + '</b>' +
@@ -2063,7 +2192,7 @@
       (cfg.mode === 'supabase'
         ? (cfg.sbUrl && cfg.sbKey && cfg.pass ? '是' : '否（URL/key/口令缺一个）')
         : (cfg.mode === 'server' ? (cfg.url ? '是' : '跟随本页') : '—')));
-    lines.push('本机账号：' + accounts().length + ' 个 · 同一空间：' + (cfg.mode === 'supabase' ? sbSpaceId() : '—'));
+    lines.push('本机账号：' + accounts().length + ' 个 · 同一空间：' + (cfg.mode === 'supabase' ? sbSpaceId(cfg) : '—'));
     lines.push('最近错误：' + (SYNC.lastError || '无'));
     say(lines.concat(['', '正在测网络…']));
 
@@ -2075,7 +2204,7 @@
     if (cfg.sbUrl && cfg.sbKey) {
       checks.push(fetchWithTimeout(trimSlashes(cfg.sbUrl) + '/rest/v1/', {
         cache: 'no-store',
-        headers: { 'apikey': cfg.sbKey, 'Authorization': 'Bearer ' + cfg.sbKey }
+        headers: sbHeaders(null, cfg)
       }, 8000).then(function (r) { return 'Supabase → HTTP ' + r.status; })
         .catch(function (e) { return 'Supabase → 连不上（' + e.message + '）'; }));
     }
@@ -2096,7 +2225,7 @@
       '<div class="pick-grid">' + list.map(function (u) {
         return '<button class="pick' + (u.id === picked ? ' on' : '') + '"' +
           ' data-action="auth-pick" data-id="' + u.id + '" aria-pressed="' + (u.id === picked ? 'true' : 'false') + '">' +
-          '<span class="pick-ava">' + u.emoji + '</span>' +
+          '<span class="pick-ava">' + esc(u.emoji) + '</span>' +
           '<span class="pick-name">' + esc(u.name) + '</span>' +
           '<span class="pick-note">' + (u.id === picked ? '已选择' : '点我') + '</span>' +
           '</button>';
@@ -2108,7 +2237,9 @@
       '<div class="auth-foot">' +
         '<span class="auth-links">' +
           '<button class="auth-link" data-action="sync-settings">同步设置</button>' +
-          '<button class="auth-link" data-action="reset-space">忘记密码？清空本机数据</button>' +
+          '<button class="auth-link" data-action="import">恢复备份</button>' +
+          '<button class="auth-link" data-action="export">导出备份</button>' +
+          '<button class="auth-link" data-action="reset-space">清空本机缓存</button>' +
         '</span>' +
         '<button class="btn btn-primary" data-action="auth-submit">' + icon('arrowRight', 16) + '进入我们的空间</button>' +
       '</div>' +
@@ -2148,6 +2279,9 @@
     var list = accounts();
 
     if (!list.length) {
+      if (state.readError || SYNC.enabled && (!SYNC.verified || syncBlocked())) {
+        return authFail('尚未成功核对云端账号，请先检查同步设置，避免重复创建空间。');
+      }
       captureDraft();
       var a = authDraft.slots[0];
       var b = authDraft.slots[1];
@@ -2193,6 +2327,7 @@
   }
 
   function doLogout() {
+    clearPendingImages();
     closeModal();
     state.auth.currentId = null;
     authDraft.pickId = null;
@@ -2206,6 +2341,7 @@
     try {
       localStorage.removeItem(CONFIG.storageKey);
     } catch (err) { /* 忽略 */ }
+    clearPendingImages();
     state = seed();
     authDraft = {
       slots: [
@@ -2215,8 +2351,9 @@
       pickId: null
     };
     closeModal();
+    syncInit();
     render();
-    toast('已经清空，重新开始吧。');
+    toast('已清空本机缓存；同步开启时会重新读取云端记录。');
   }
 
   function openAccountModal() {
@@ -2233,7 +2370,7 @@
           '</div>' +
           '<div class="modal-body">' +
             '<div class="account-now">' +
-            '<span class="pick-ava">' + me.emoji + '</span>' +
+            '<span class="pick-ava">' + esc(me.emoji) + '</span>' +
             '<div>' +
               '<p class="slot-name">' + esc(me.name) + '</p>' +
               '<p class="pick-note">当前登录 · ' + (moodOf(currentWho(), 0) ? '今天的记录者' : '还没有记录今天的心情') + '</p>' +
@@ -2245,6 +2382,7 @@
             '<div class="sync-actions">' +
               '<button class="btn btn-ghost" data-action="sync-now">' + icon('share', 15) + '立即同步</button>' +
               '<button class="btn btn-ghost" data-action="import">' + icon('download', 15) + '导入记录</button>' +
+              '<button class="btn btn-ghost" data-action="export">' + icon('upload', 15) + '导出备份</button>' +
             '</div>' +
           '</div>' +
           '<p class="sync-hint" id="sync-hint">' + syncHint() + '</p>' +
@@ -2267,6 +2405,7 @@
     document.getElementById('sidebar').innerHTML = sidebar();
     document.getElementById('topbar').innerHTML = topbar();
     document.getElementById('view').innerHTML = v.render();
+    renderPendingImages();
     var tb = document.getElementById('tabbar');
     if (tb) tb.innerHTML = tabbar();
     document.title = v.title + ' · 两人小日子';
@@ -2347,6 +2486,7 @@
 
   function closeModal() {
     document.getElementById('modal-root').innerHTML = '';
+    if (pendingRender) setTimeout(safeRender, 0);
   }
 
   function saveModal() {
@@ -2357,7 +2497,7 @@
 
     if (modal.kind === 'expense') {
       var amountEl = document.getElementById('modal-amount');
-      var amount = Math.abs(parseFloat(amountEl && amountEl.value ? amountEl.value : '0')) || 0;
+      var amount = money(amountEl && amountEl.value);
       if (!amount) { toast('金额还没填呢～'); return; }
       state.ledger.push({
         id: uid('l'), title: value || '一笔小开销', cat: '💸',
@@ -2370,7 +2510,7 @@
 
     if (modal.kind === 'todo') {
       if (!value) { toast('写点什么吧～'); return; }
-      state.todos.push({ id: uid('t'), text: value, when: '今天', tag: '一起', done: false, updatedAt: Date.now() });
+      state.todos.push({ id: uid('t'), text: value, when: '今天', dueDate: isoDay(today()), tag: '一起', done: false, updatedAt: Date.now() });
       saveState(); closeModal(); render();
       toast('加进今天的小事里了。');
       return;
@@ -2382,7 +2522,7 @@
       existing.mood = modal.mood;
       existing.note = value || existing.note;
       existing.time = time;
-      existing.updatedAt = Date.now();
+      existing.updatedAt = editTime(existing);
     } else {
       state.moods.push({
         id: uid('m'), day: 0, date: isoDay(today()), who: who, mood: modal.mood,
@@ -2399,7 +2539,7 @@
     var t = state.todos.filter(function (x) { return x.id === id; })[0];
     if (!t) return;
     t.done = !t.done;
-    t.updatedAt = Date.now();
+    t.updatedAt = editTime(t);
     saveState();
     render();
     if (t.done) toast('完成啦：' + t.text);
@@ -2410,7 +2550,9 @@
     if (!el) return;
     var value = el.value.trim();
     if (!value) { toast('写点什么吧～'); return; }
-    state.todos.push({ id: uid('t'), text: value, when: '今天', tag: '一起', done: false, updatedAt: Date.now() });
+    var dueDate = valueOf('new-todo-date') || isoDay(today());
+    if (!validDay(dueDate)) { toast('请选择有效的待办日期。'); return; }
+    state.todos.push({ id: uid('t'), text: value, when: '今天', dueDate: dueDate, tag: '一起', done: false, updatedAt: Date.now() });
     saveState(); render(); toast('加进今天的小事里了。');
   }
 
@@ -2420,9 +2562,9 @@
     var value = el.value.trim();
     if (!value) { toast('写一个心愿吧～'); return; }
     var targetEl = document.getElementById('new-wish-target');
-    var target = Math.abs(parseFloat(targetEl && targetEl.value ? targetEl.value : '') || 0);
-    if (!target) target = 2000;
-    state.wishes.push({ id: uid('w'), emoji: '✨', title: value, target: target, saved: 0, status: '等你一起商量', updatedAt: Date.now() });
+    var target = targetEl && targetEl.value ? money(targetEl.value) : 2000;
+    if (!target) { toast('目标请填写大于 0、最多十亿元的金额。'); return; }
+    state.wishes.push({ id: uid('w'), emoji: '✨', title: value, target: target, saved: 0, savedBase: 0, status: '等你一起商量', updatedAt: Date.now() });
     saveState(); render(); toast('心愿已经放进清单了，目标 ¥' + num(target, 0) + '。');
   }
 
@@ -2431,14 +2573,9 @@
     if (!rec) return;
     var label = rec.text || rec.title || rec.note || rec.who || '这条记录';
     if (!window.confirm('删除「' + label + '」？\n两台设备都会一起删掉。')) return;
-    // 删掉一条存进心愿的记录，要把心愿的已存金额退回去
-    if (kind === 'savingsLog' && rec.wishId) {
-      var w = findRecord('wishes', rec.wishId);
-      if (w) {
-        w.saved = Math.max(0, (w.saved || 0) - (rec.amount || 0));
-        w.updatedAt = Date.now();
-      }
-    }
+    if (kind === 'posts') state.comments.forEach(function (c) {
+      if (c.postId === id && !c.deleted) killRecord('comments', c.id);
+    });
     if (!killRecord(kind, id)) return;
     saveState();
     render();
@@ -2450,13 +2587,15 @@
     var amountEl = document.getElementById('new-ledger-amount');
     var kindEl = document.getElementById('new-ledger-kind');
     var title = titleEl ? titleEl.value.trim() : '';
-    var amount = Math.abs(parseFloat(amountEl && amountEl.value ? amountEl.value : '') || 0);
+    var amount = money(amountEl && amountEl.value);
     var income = !!(kindEl && kindEl.value === 'in');
     if (!title) { toast('这笔钱是干嘛的？写一句吧。'); return; }
     if (!amount) { toast('金额还没填。'); return; }
+    var date = valueOf('new-ledger-date') || isoDay(today());
+    if (!validDay(date) || date > isoDay(today())) { toast('记账日期请选择今天或之前的日期。'); return; }
     state.ledger.push({
       id: uid('l'), title: title, cat: income ? '💰' : '💸',
-      who: currentName(), amount: income ? amount : -amount, day: 0, date: isoDay(today()), updatedAt: Date.now()
+      who: currentName(), amount: income ? amount : -amount, day: 0, date: date, updatedAt: Date.now()
     });
     saveState(); render();
     toast((income ? '记下一笔收入 ¥' : '记下一笔支出 ¥') + num(amount));
@@ -2464,7 +2603,7 @@
 
   function addSavingFromForm() {
     var el = document.getElementById('new-saving');
-    var amount = Math.abs(parseFloat(el && el.value ? el.value : '') || 0);
+    var amount = money(el && el.value);
     if (!amount) { toast('想存多少？填个数字。'); return; }
     saveMoney(amount, selectedWishId());
   }
@@ -2484,7 +2623,7 @@
       id: uid('p'), who: currentWho(), text: text, images: images, day: 0, date: isoDay(today()),
       time: pad2(now.getHours()) + ':' + pad2(now.getMinutes()), updatedAt: Date.now()
     });
-    pendingImages = [];
+    clearPendingImages();
     saveState(); render();
     toast(images.length ? '发出去了，' + images.length + ' 张图。' : '已经发出去了。');
   }
@@ -2492,6 +2631,11 @@
   /* --------------------------------------------------------- 说说配图 */
 
   var pendingImages = [];
+
+  function clearPendingImages() {
+    pendingImages.forEach(function (it) { if (it.preview) URL.revokeObjectURL(it.preview); });
+    pendingImages = [];
+  }
 
   function compressOnce(file, maxSide, quality) {
     return new Promise(function (resolve, reject) {
@@ -2543,17 +2687,15 @@
   function uploadToStorage(blob) {
     var cfg = SYNC.cfg;
     var bucket = cfg.mediaBucket || 'media';
-    var name = 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8) + '.jpg';
+    var name = sbSpaceId(cfg) + '/' + uid('p') + '.jpg';
     var base = trimSlashes(cfg.sbUrl);
     return fetchWithTimeout(base + '/storage/v1/object/' + bucket + '/' + name, {
       method: 'POST',
-      headers: {
-        'apikey': cfg.sbKey,
-        'Authorization': 'Bearer ' + cfg.sbKey,
+      headers: sbHeaders({
         'Content-Type': 'image/jpeg',
         'x-upsert': 'false',
         'cache-control': 'max-age=31536000'
-      },
+      }, cfg),
       body: blob
     }).then(function (res) {
       if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -2562,15 +2704,11 @@
   }
 
   // 配了 Supabase 就传到 Storage（帖子里只存链接，同步数据不会被图片撑大）；
-  // 没配就退化成内联 base64，只在这台设备看得到。
+  // 没配就保存内联图片；开启同步后也会随记录同步，注意本机容量。
   function saveImage(blob) {
     var cfg = SYNC.cfg || {};
     if (activeMode() === 'supabase' && cfg.sbUrl && cfg.sbKey) {
-      return uploadToStorage(blob).catch(function (err) {
-        if (window.console) console.warn('图片上传失败，改成存本机。', err);
-        toast('图片没传上云，先存在这台设备了。');
-        return blobToDataUrl(blob);
-      });
+      return uploadToStorage(blob);
     }
     return blobToDataUrl(blob);
   }
@@ -2602,19 +2740,25 @@
       return;
     }
     files.forEach(function (file) {
-      var item = { url: URL.createObjectURL(file), uploading: true };
+      var preview = URL.createObjectURL(file);
+      var item = { url: preview, preview: preview, uploading: true };
       pendingImages.push(item);
       renderPendingImages();
       compressImage(file).then(function (blob) {
         return saveImage(blob).then(function (finalUrl) {
+          URL.revokeObjectURL(preview);
+          if (pendingImages.indexOf(item) < 0) return;
           item.url = finalUrl;
           item.uploading = false;
           renderPendingImages();
         });
       }).catch(function () {
-        item.uploading = false;
+        URL.revokeObjectURL(preview);
+        var index = pendingImages.indexOf(item);
+        if (index < 0) return;
+        pendingImages.splice(index, 1);
         renderPendingImages();
-        toast('这张图没处理成功，换一张试试。');
+        toast('图片处理或上传失败，请检查网络及 Storage 权限后重新选择。');
       });
     });
   }
@@ -2622,6 +2766,7 @@
   function dropImage(index) {
     var i = Number(index);
     if (isNaN(i) || !pendingImages[i]) return;
+    if (pendingImages[i].preview) URL.revokeObjectURL(pendingImages[i].preview);
     pendingImages.splice(i, 1);
     renderPendingImages();
   }
@@ -2655,7 +2800,7 @@
 
   function saveGoal() {
     var el = document.getElementById('goal-input');
-    var v = Math.abs(parseFloat(el && el.value ? el.value : '') || 0);
+    var v = money(el && el.value);
     if (!v || v < 1) {
       var errBox = document.getElementById('goal-error');
       if (errBox) errBox.textContent = '填一个大于 0 的金额。';
@@ -2663,6 +2808,7 @@
       return;
     }
     state.saving.goal = Math.round(v);
+    state.saving.updatedAt = editTime(state.saving);
     saveState();
     closeModal();
     render();
@@ -2800,7 +2946,7 @@
     if (existing) {
       existing.mood = mood;
       existing.time = time;
-      existing.updatedAt = Date.now();
+      existing.updatedAt = editTime(existing);
     } else {
       state.moods.push({
         id: uid('m'), day: 0, date: isoDay(today()), who: who, mood: mood,
@@ -2813,17 +2959,16 @@
   }
 
   function saveMoney(amount, wishId) {
+    amount = money(amount);
+    if (!amount) { toast('请填写有效的正数金额。'); return; }
+    var wish = wishId ? findRecord('wishes', wishId) : null;
+    if (wishId && (!wish || wish.deleted)) { toast('这个心愿已被删除，请重新选择。'); return; }
     var now = new Date();
     var time = pad2(now.getHours()) + ':' + pad2(now.getMinutes());
     state.savingsLog.push({
       id: uid('s'), who: currentName(), amount: amount, day: 0, date: isoDay(today()), time: time,
       wishId: wishId || '', updatedAt: Date.now()
     });
-    var wish = wishId ? findRecord('wishes', wishId) : null;
-    if (wish) {
-      wish.saved = (wish.saved || 0) + amount;
-      wish.updatedAt = Date.now();
-    }
     state.saving.saved = savedTotal();
     saveState(); render();
     toast(wish
@@ -2846,7 +2991,7 @@
   function wishProgressRow(w) {
     var pct = w.target ? Math.min(100, Math.round((w.saved / w.target) * 100)) : 0;
     return '<li class="wish-row">' +
-      '<span class="cat">' + w.emoji + '</span>' +
+      '<span class="cat">' + esc(w.emoji) + '</span>' +
       '<div class="todo-main">' +
         '<p class="todo-text">' + esc(w.title) + '</p>' +
         '<div class="bar" style="margin:7px 0 6px"><i class="bar-fill" style="width:' + pct + '%"></i></div>' +
@@ -2857,17 +3002,9 @@
   }
 
   function exportData() {
-    var payload = {
-      exportedAt: new Date().toISOString(),
-      space: CONFIG.spaceName,
-      todos: state.todos,
-      ledger: state.ledger,
-      wishes: state.wishes,
-      saving: state.saving,
-      savingsLog: state.savingsLog,
-      moods: state.moods
-    };
-    var blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    var payload = Object.assign({ schemaVersion: 2, exportedAt: new Date().toISOString(), space: CONFIG.spaceName }, syncedPayload());
+    var contents = state.readError ? localStorage.getItem(CONFIG.storageKey) : JSON.stringify(payload, null, 2);
+    var blob = new Blob([contents], { type: 'application/json' });
     var url = URL.createObjectURL(blob);
     var a = document.createElement('a');
     a.href = url;
@@ -2881,8 +3018,9 @@
 
   function shareSpace() {
     var text = '两人小日子 · 我们在一起的第 ' + daysTogether() + ' 天。';
+    var link = location.origin + location.pathname + '#/' + state.view;
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text + ' ' + location.href).then(function () {
+      navigator.clipboard.writeText(text + ' ' + link).then(function () {
         toast('空间链接已经复制好啦。');
       }).catch(function () { toast(text); });
     } else {
@@ -2991,6 +3129,12 @@
       case 'sync-save':
         saveSyncSettings();
         break;
+      case 'generate-access-token':
+        captureSyncForm();
+        syncDraft.accessToken = randomSalt() + randomSalt() + randomSalt();
+        renderSyncModal();
+        toast('已生成访问密钥；已有空间请先完成 SQL 权限迁移，再保存同步设置。');
+        break;
       case 'copy-sql':
         copySql();
         break;
@@ -3047,9 +3191,10 @@
         savePassword();
         break;
       case 'sync-now':
-        if (!SYNC.enabled) { toast('现在是仅本机模式：用 server.py 打开页面才能同步。'); break; }
-        SYNC.snapshot = null;
-        push();
+        if (!SYNC.enabled) { openSyncModal(); break; }
+        if (syncBlocked()) { openSyncModal(); break; }
+        SYNC.nextTry = 0;
+        tick();
         toast('正在同步…');
         break;
       case 'import':
@@ -3090,6 +3235,7 @@
   });
 
   document.addEventListener('keydown', function (ev) {
+    if (ev.isComposing || ev.keyCode === 229) return;
     if (ev.key === 'Enter' && ev.target && ev.target.dataset && ev.target.dataset.enter) {
       ev.preventDefault();
       run(ev.target.dataset.enter, ev.target);
@@ -3121,6 +3267,10 @@
     render();
     if (!location.hash) setHash(state.view);
     registerSW();
+    var day = isoDay(today());
+    setInterval(function () {
+      if (!document.hidden && day !== isoDay(today())) { day = isoDay(today()); safeRender(); }
+    }, 60000);
   }
 
   // 装成 App 用：注册 Service Worker（file:// 下浏览器不允许，跳过即可）
@@ -3134,12 +3284,21 @@
 
   document.addEventListener('focusout', function () {
     if (!pendingRender) return;
-    pendingRender = false;
-    setTimeout(render, 0);
+    setTimeout(safeRender, 0);
   });
 
   document.addEventListener('change', function (ev) {
     if (ev.target && ev.target.id === 'post-image-input') onImagePicked(ev.target);
+  });
+  window.addEventListener('storage', function (event) {
+    if (event.key !== CONFIG.storageKey || !event.newValue || state.readError) return;
+    try {
+      var next = mergeStates(state, JSON.parse(event.newValue));
+      if (JSON.stringify(syncedPayload(next)) === JSON.stringify(syncedPayload())) return;
+      state = next;
+      saveState();
+      safeRender();
+    } catch (err) { toast('另一个标签页的数据无法合并，请先导出备份。'); }
   });
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);

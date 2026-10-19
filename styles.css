@@ -1085,6 +1085,10 @@ pre.sql {
 .select-input { flex: 0 0 84px; }
 .select-wide { flex: 1 1 140px; min-width: 0; max-width: 220px; }
 .num-input { flex: 0 0 104px; }
+.date-input { flex: 0 1 152px; min-width: 136px; color-scheme: dark; }
+.sync-chip.badkey, .sync-chip.dataerror, .sync-chip.accountconflict { color: var(--danger); border-color: rgba(228,145,122,.35); }
+.sync-chip.badkey .sync-dot, .sync-chip.dataerror .sync-dot, .sync-chip.accountconflict .sync-dot { background: var(--danger); }
+.sync-note code, .modal .dim code { overflow-wrap: anywhere; }
 
 /* 存钱页里的心愿进度行 */
 .wish-row {
