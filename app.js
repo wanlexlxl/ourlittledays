@@ -89,9 +89,23 @@
     return fmtMD(d);
   }
 
+  // 记录里存的是绝对日期（YYYY-MM-DD），显示时再换算成「今天/昨天」。
+  // 早先版本存的是「相对天数」，过一天就会一直显示"今天"，这里做兼容。
+  function recordOffset(rec) {
+    if (rec && rec.date) {
+      var d = new Date(rec.date + 'T12:00:00');
+      if (!isNaN(d.getTime())) return Math.round((d - today()) / 86400000);
+    }
+    return (rec && typeof rec.day === 'number') ? rec.day : 0;
+  }
+
   function entryDate(e) {
+    if (e && e.date) {
+      var fixed = new Date(e.date + 'T12:00:00');
+      if (!isNaN(fixed.getTime())) return fixed;
+    }
     var d = today();
-    d.setDate(d.getDate() + e.day);
+    d.setDate(d.getDate() + ((e && typeof e.day === 'number') ? e.day : 0));
     return d;
   }
 
@@ -164,7 +178,7 @@
     var monthRoom = Math.max(1, today().getDate() - 1);
     var ago = function (n) { return -Math.min(n, monthRoom); };
 
-    return {
+    var data = {
       view: 'overview',
       auth: { accounts: [], currentId: null },
       todos: [
@@ -217,6 +231,19 @@
         { id: 'c2', postId: 'p2', who: 'a', text: '糊也好看，因为是你拍的。', day: -1, time: '19:00' }
       ]
     };
+
+    // 示例数据用的是相对天数，这里把它落成绝对日期，免得第二天还显示"今天"
+    var dayDate = function (offset) {
+      var d = today();
+      d.setDate(d.getDate() + offset);
+      return isoDay(d);
+    };
+    ['ledger', 'savingsLog', 'moods', 'posts', 'comments'].forEach(function (key) {
+      (data[key] || []).forEach(function (rec) {
+        if (rec && !rec.date && typeof rec.day === 'number') rec.date = dayDate(rec.day);
+      });
+    });
+    return data;
   }
 
   var MOODS = [
@@ -264,6 +291,8 @@
     ready: false,        // 是否已经和服务端核对过一次
     autoOk: false,       // 「跟随本页」时同源到底有没有 server.py
     lastError: '',       // 最近一次同步失败的原因，方便排查
+    fails: 0,            // 连续失败次数（用于退避）
+    nextTry: 0,          // 下一次允许重试的时间戳
     status: 'local',     // local | syncing | ok | offline | needtoken | badkey
     rev: 0,
     dirty: false,
@@ -417,6 +446,30 @@
     return res.json();
   }
 
+  // 带超时的 fetch：网络被墙/丢包时 fetch 会一直挂着不返回，
+  // 没有这个保护界面就会永远停在「同步中」，而且不会再重试。
+  function fetchWithTimeout(url, options, ms) {
+    var opts = options || {};
+    var limit = ms || 12000;
+    if (typeof AbortController === 'undefined') return fetch(url, opts);
+    var ctrl = new AbortController();
+    var timer = setTimeout(function () {
+      try { ctrl.abort(); } catch (e) { /* 忽略 */ }
+    }, limit);
+    opts.signal = ctrl.signal;
+    if (!opts.cache) opts.cache = 'no-store';
+    return fetch(url, opts).then(function (res) {
+      clearTimeout(timer);
+      return res;
+    }, function (err) {
+      clearTimeout(timer);
+      if (err && (err.name === 'AbortError' || String(err).toLowerCase().indexOf('abort') >= 0)) {
+        throw new Error('TIMEOUT');
+      }
+      throw err;
+    });
+  }
+
   function sbHeaders(extra) {
     var cfg = SYNC.cfg;
     var head = {
@@ -430,7 +483,7 @@
 
   function apiPull(force) {
     if (activeMode() === 'supabase') return sbPull(force);
-    return fetch(apiPath() + '?since=' + (force ? 0 : SYNC.rev), {
+    return fetchWithTimeout(apiPath() + '?since=' + (force ? 0 : SYNC.rev), {
       cache: 'no-store',
       headers: syncHeaders()
     }).then(jsonOrThrow).then(function (res) {
@@ -441,7 +494,7 @@
 
   function apiPush() {
     if (activeMode() === 'supabase') return sbPush();
-    return fetch(apiPath(), {
+    return fetchWithTimeout(apiPath(), {
       method: 'POST',
       cache: 'no-store',
       headers: syncHeaders({ 'Content-Type': 'application/json' }),
@@ -454,7 +507,7 @@
   function sbPull(force) {
     var table = trimSlashes(SYNC.cfg.sbUrl) + '/rest/v1/little_days' +
       '?id=eq.' + encodeURIComponent(sbSpaceId()) + '&select=rev,payload';
-    return fetch(table, { cache: 'no-store', headers: sbHeaders() })
+    return fetchWithTimeout(table, { cache: 'no-store', headers: sbHeaders() })
       .then(jsonOrThrow)
       .then(function (rows) {
         if (!rows || !rows.length) return { rev: 0, data: null };
@@ -474,7 +527,7 @@
         payload: payload,
         updated_at: new Date().toISOString()
       };
-      return fetch(trimSlashes(SYNC.cfg.sbUrl) + '/rest/v1/little_days', {
+      return fetchWithTimeout(trimSlashes(SYNC.cfg.sbUrl) + '/rest/v1/little_days', {
         method: 'POST',
         cache: 'no-store',
         headers: sbHeaders({
@@ -586,6 +639,8 @@
     SYNC.busy = false;
     SYNC.autoOk = false;
     SYNC.lastError = '';
+    SYNC.fails = 0;
+    SYNC.nextTry = 0;
 
     // 「跟随本页」模式：先探一下同源有没有 server.py。
     // 放在 GitHub Pages 这类静态托管上时不应该被判成"离线"，而应该是"仅本机"。
@@ -593,7 +648,7 @@
       SYNC.enabled = false;
       SYNC.status = 'local';
       updateSyncChip();
-      fetch('api/ping', { cache: 'no-store' })
+      fetchWithTimeout('api/ping', { cache: 'no-store' }, 5000)
         .then(function (r) { return r.ok ? r.json() : null; })
         .then(function (res) {
           SYNC.autoOk = !!(res && res.ok);
@@ -606,6 +661,7 @@
   }
 
   function startSync() {
+    SYNC.busy = false;            // 别被上一次卡住的请求锁死
     SYNC.enabled = activeMode() !== 'off';
     if (!SYNC.enabled) {
       SYNC.status = 'local';
@@ -626,6 +682,8 @@
 
   function tick() {
     if (!SYNC.enabled || SYNC.busy || document.hidden) return;
+    // 失败后先别急着试，按退避等一会儿（避免一直闪着"同步中"）
+    if (SYNC.status === 'offline' && Date.now() < (SYNC.nextTry || 0)) return;
     // 本地和「服务端已确认」的内容不一致，就先推上去，再拉
     if (SYNC.snapshot === null || JSON.stringify(syncedPayload()) !== SYNC.snapshot) {
       push();
@@ -634,12 +692,36 @@
     pull(false);
   }
 
+  // 后台重试不要改状态标签：已经是"离线"就保持"离线"，成功了自然变"已同步"
+  function beginSync() {
+    if (SYNC.status === 'offline' || SYNC.status === 'needtoken' || SYNC.status === 'badkey') return;
+    setSyncStatus('syncing');
+  }
+
   function handleSyncError(err) {
     var code = String(err && err.message ? err.message : err);
-    SYNC.lastError = code;
+    var friendly = code;
+    if (code === 'TIMEOUT') {
+      friendly = '请求超时（12 秒没有响应，网络可能被挡）';
+    } else if (/failed to fetch|networkerror|load failed|abort/i.test(code)) {
+      friendly = '连不上服务器（网络被拦或没有响应）';
+    } else if (/^HTTP 5\d\d$/.test(code)) {
+      friendly = '云端出错（' + code + '），稍后会自动重试';
+    }
+    SYNC.lastError = friendly;
+    SYNC.fails = (SYNC.fails || 0) + 1;
+    SYNC.nextTry = Date.now() + Math.min(60000, 5000 * Math.pow(2, SYNC.fails - 1));
     if (code === 'DECRYPT_FAILED' || code === 'DECRYPT_FORMAT') setSyncStatus('badkey');
     else if (code !== 'NEED_TOKEN') setSyncStatus('offline');
     updateSyncChip();
+  }
+
+  function syncSucceeded() {
+    SYNC.fails = 0;
+    SYNC.nextTry = 0;
+    SYNC.lastError = '';
+    setSyncStatus('ok');
+    SYNC.lastAt = Date.now();
   }
 
   function pull(force) {
@@ -651,14 +733,13 @@
         var first = !SYNC.ready;
         SYNC.ready = true;
         if (res.unchanged) {
-          setSyncStatus('ok');
+          syncSucceeded();
           if (first) render();
           return;
         }
         SYNC.rev = res.rev || 0;
         if (res.data) applyRemote(res.data);
-        setSyncStatus('ok');
-        SYNC.lastAt = Date.now();
+        syncSucceeded();
         if (first) render();
       })
       .catch(function (err) {
@@ -675,15 +756,14 @@
     if (SYNC.busy) { SYNC.dirty = true; return; }
     SYNC.busy = true;
     SYNC.dirty = false;
-    setSyncStatus('syncing');
+    beginSync();
     apiPush()
       .then(function (res) {
         SYNC.busy = false;
         SYNC.rev = res.rev || 0;
         if (res.data) applyRemote(res.data);
         SYNC.snapshot = JSON.stringify(syncedPayload());
-        setSyncStatus('ok');
-        SYNC.lastAt = Date.now();
+        syncSucceeded();
       })
       .catch(function (err) {
         SYNC.busy = false;
@@ -1174,7 +1254,7 @@
   }
 
   function todaySpend() {
-    return Math.abs(sum(expenses(function (e) { return e.day === 0; })));
+    return Math.abs(sum(expenses(function (e) { return recordOffset(e) === 0; })));
   }
 
   function monthSpend() {
@@ -1211,7 +1291,7 @@
   }
 
   function moodOf(who, day) {
-    var list = alive(state.moods).filter(function (m) { return m.who === who && m.day === day; });
+    var list = alive(state.moods).filter(function (m) { return m.who === who && recordOffset(m) === day; });
     return list.length ? list[list.length - 1] : null;
   }
 
@@ -1566,7 +1646,7 @@
         var expense = monthSpend();
         var income = monthIncome();
         var live = alive(state.ledger);
-        var rows = live.slice().sort(function (a, b) { return b.day - a.day; });
+        var rows = live.slice().sort(function (a, b) { return recordOffset(b) - recordOffset(a); });
         var cards = [
           { t: '本月支出', v: '<span class="cur">¥</span>' + num(expense), ic: 'receipt' },
           { t: '本月收入', v: '<span class="cur">¥</span>' + num(income), ic: 'sprout' },
@@ -1632,7 +1712,7 @@
       lede: '共同存的小目标，已经开始了。',
       render: function () {
         var pct = savingPct();
-        var logs = alive(state.savingsLog).slice().sort(function (a, b) { return b.day - a.day; });
+        var logs = alive(state.savingsLog).slice().sort(function (a, b) { return recordOffset(b) - recordOffset(a); });
         var saved = savedTotal();
         return pageHead(VIEWS.savings) +
           '<section class="card panel reveal" style="--d:40ms">' +
@@ -1677,7 +1757,7 @@
                 '<span class="cat">' + (w ? w.emoji : '🪙') + '</span>' +
                 '<div class="todo-main"><p class="todo-text">' + esc(l.who) + ' 存了一笔' +
                   (w ? ' · ' + esc(w.title) : '') + '</p>' +
-                '<p class="todo-when">' + dayLabel(l.day) + '</p></div>' +
+                '<p class="todo-when">' + dayLabel(recordOffset(l)) + '</p></div>' +
                 '<span class="amount in">+' + num(l.amount, 0) + '</span>' +
                 delButton('savingsLog', l.id, l.who + ' 存入 ' + l.amount) +
                 '</li>';
@@ -1707,7 +1787,7 @@
             }).join('') + '</div></section>';
         }).join('');
 
-        var history = alive(state.moods).slice().sort(function (a, b) { return b.day - a.day; });
+        var history = alive(state.moods).slice().sort(function (a, b) { return recordOffset(b) - recordOffset(a); });
 
         return pageHead(VIEWS.moods) + picker +
           '<section class="card panel reveal" style="--d:120ms">' +
@@ -1717,7 +1797,7 @@
               return '<li class="history-row">' +
                 '<span class="history-emoji">' + m.mood + '</span>' +
                 '<div class="todo-main"><p class="history-note">' + esc(m.note) + '</p>' +
-                '<p class="history-time">' + person(m.who).name + ' · ' + dayLabel(m.day) + ' ' + m.time + '</p></div>' +
+                '<p class="history-time">' + person(m.who).name + ' · ' + dayLabel(recordOffset(m)) + ' ' + m.time + '</p></div>' +
                 delButton('moods', m.id, m.note) +
                 '</li>';
             }).join('') + '</ul>' : '<p class="empty">还没有心情记录。</p>') +
@@ -1734,7 +1814,8 @@
       render: function () {
         var me = currentUser() || { emoji: '🍀' };
         var list = alive(state.posts).slice().sort(function (a, b) {
-          if (a.day !== b.day) return b.day - a.day;
+          var da = recordOffset(a), db = recordOffset(b);
+          if (da !== db) return db - da;
           return String(b.time || '').localeCompare(String(a.time || ''));
         });
 
@@ -1766,7 +1847,7 @@
         '<span class="post-ava">' + who.emoji + '</span>' +
         '<div class="post-meta">' +
           '<p class="post-name">' + esc(who.name) + '</p>' +
-          '<p class="post-time">' + dayLabel(p.day) + ' ' + esc(p.time || '') + '</p>' +
+          '<p class="post-time">' + dayLabel(recordOffset(p)) + ' ' + esc(p.time || '') + '</p>' +
         '</div>' +
         delButton('posts', p.id, p.text) +
       '</div>' +
@@ -1800,7 +1881,7 @@
       '<span class="cat">' + e.cat + '</span>' +
       '<div class="todo-main">' +
         '<p class="todo-text">' + esc(e.title) + '</p>' +
-        '<p class="todo-when">' + dayLabel(e.day) + ' · ' + esc(e.who) + '</p>' +
+        '<p class="todo-when">' + dayLabel(recordOffset(e)) + ' · ' + esc(e.who) + '</p>' +
       '</div>' +
       '<span class="amount ' + (income ? 'in' : 'out') + '">' +
         (income ? '+' : '−') + num(Math.abs(e.amount)) + '</span>' +
@@ -1987,15 +2068,15 @@
     say(lines.concat(['', '正在测网络…']));
 
     var checks = [];
-    checks.push(fetch('api/ping', { cache: 'no-store' })
+    checks.push(fetchWithTimeout('api/ping', { cache: 'no-store' }, 8000)
       .then(function (r) { return '同源 /api/ping → HTTP ' + r.status; })
       .catch(function (e) { return '同源 /api/ping → 不通（' + e.message + '）'; }));
 
     if (cfg.sbUrl && cfg.sbKey) {
-      checks.push(fetch(trimSlashes(cfg.sbUrl) + '/rest/v1/', {
+      checks.push(fetchWithTimeout(trimSlashes(cfg.sbUrl) + '/rest/v1/', {
         cache: 'no-store',
         headers: { 'apikey': cfg.sbKey, 'Authorization': 'Bearer ' + cfg.sbKey }
-      }).then(function (r) { return 'Supabase → HTTP ' + r.status; })
+      }, 8000).then(function (r) { return 'Supabase → HTTP ' + r.status; })
         .catch(function (e) { return 'Supabase → 连不上（' + e.message + '）'; }));
     }
 
@@ -2280,7 +2361,7 @@
       if (!amount) { toast('金额还没填呢～'); return; }
       state.ledger.push({
         id: uid('l'), title: value || '一笔小开销', cat: '💸',
-        who: currentName(), amount: -amount, day: 0, updatedAt: Date.now()
+        who: currentName(), amount: -amount, day: 0, date: isoDay(today()), updatedAt: Date.now()
       });
       saveState(); closeModal(); render();
       toast('记下了 ¥' + num(amount) + '，谢谢你为这个家花的钱。');
@@ -2304,7 +2385,7 @@
       existing.updatedAt = Date.now();
     } else {
       state.moods.push({
-        id: uid('m'), day: 0, who: who, mood: modal.mood,
+        id: uid('m'), day: 0, date: isoDay(today()), who: who, mood: modal.mood,
         note: value || '今天也想和你说说话。', time: time, updatedAt: Date.now()
       });
     }
@@ -2375,7 +2456,7 @@
     if (!amount) { toast('金额还没填。'); return; }
     state.ledger.push({
       id: uid('l'), title: title, cat: income ? '💰' : '💸',
-      who: currentName(), amount: income ? amount : -amount, day: 0, updatedAt: Date.now()
+      who: currentName(), amount: income ? amount : -amount, day: 0, date: isoDay(today()), updatedAt: Date.now()
     });
     saveState(); render();
     toast((income ? '记下一笔收入 ¥' : '记下一笔支出 ¥') + num(amount));
@@ -2400,7 +2481,7 @@
     if (!text && !images.length) { toast('写点什么或者加张图再发布吧。'); return; }
     var now = new Date();
     state.posts.push({
-      id: uid('p'), who: currentWho(), text: text, images: images, day: 0,
+      id: uid('p'), who: currentWho(), text: text, images: images, day: 0, date: isoDay(today()),
       time: pad2(now.getHours()) + ':' + pad2(now.getMinutes()), updatedAt: Date.now()
     });
     pendingImages = [];
@@ -2464,7 +2545,7 @@
     var bucket = cfg.mediaBucket || 'media';
     var name = 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8) + '.jpg';
     var base = trimSlashes(cfg.sbUrl);
-    return fetch(base + '/storage/v1/object/' + bucket + '/' + name, {
+    return fetchWithTimeout(base + '/storage/v1/object/' + bucket + '/' + name, {
       method: 'POST',
       headers: {
         'apikey': cfg.sbKey,
@@ -2596,7 +2677,7 @@
     if (!text) { toast('写句评论吧。'); return; }
     var now = new Date();
     state.comments.push({
-      id: uid('c'), postId: postId, who: currentWho(), text: text, day: 0,
+      id: uid('c'), postId: postId, who: currentWho(), text: text, day: 0, date: isoDay(today()),
       time: pad2(now.getHours()) + ':' + pad2(now.getMinutes()), updatedAt: Date.now()
     });
     saveState(); render();
@@ -2722,7 +2803,7 @@
       existing.updatedAt = Date.now();
     } else {
       state.moods.push({
-        id: uid('m'), day: 0, who: who, mood: mood,
+        id: uid('m'), day: 0, date: isoDay(today()), who: who, mood: mood,
         note: mood === '😔' ? '有点不开心，但没关系。' : '今天也记一笔。', time: time,
         updatedAt: Date.now()
       });
@@ -2735,7 +2816,7 @@
     var now = new Date();
     var time = pad2(now.getHours()) + ':' + pad2(now.getMinutes());
     state.savingsLog.push({
-      id: uid('s'), who: currentName(), amount: amount, day: 0, time: time,
+      id: uid('s'), who: currentName(), amount: amount, day: 0, date: isoDay(today()), time: time,
       wishId: wishId || '', updatedAt: Date.now()
     });
     var wish = wishId ? findRecord('wishes', wishId) : null;
